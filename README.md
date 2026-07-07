@@ -13,7 +13,9 @@ input/manager_mic_mono.wav + input/manager_reference_clean.wav
 Primary outputs:
 
 - `output/manager_speech_tse_raw.wav`
+- `output/manager_speech_clean_prefilter.wav`
 - `output/manager_speech_clean.wav`
+- `output/manager_noise_residual_prefilter.wav`
 - `output/manager_noise_residual.wav`
 - `output/report.json`
 
@@ -161,9 +163,11 @@ output/original_aligned.wav
 output/manager_speech_tse_raw.wav
 output/manager_speech_tse_aligned.wav
 output/manager_speech_tse_gainmatched.wav
+output/manager_speech_clean_prefilter.wav
 output/manager_speech_clean.wav
 output/manager_noise_residual_raw.wav
 output/manager_noise_residual_subtract.wav
+output/manager_noise_residual_prefilter.wav
 output/manager_noise_residual.wav
 output/report.json
 output/candidates/*.wav
@@ -173,13 +177,16 @@ output/references/*.wav
 `manager_speech_tse_aligned.wav` is the selected TSE output after delay
 alignment. `manager_speech_tse_gainmatched.wav` is aligned and loudness-matched
 to active speech-like regions in the input. `manager_speech_clean.wav` is the
-post-enhanced listening speech; by default it uses `input_matched` active
-loudness rather than a fixed -23 dBFS target, then applies a true-peak style
-sample peak limiter. `manager_noise_residual_subtract.wav` is the conservative
-direct-subtraction residual. `manager_noise_residual.wav` is the listening
-residual: it uses `manager_speech_clean.wav` as a spectral guide, aggressively
-suppresses bins that look like the manager's voice, and is gently lifted toward
--45 dBFS for easier listening.
+post-enhanced speech before the final residual-guided denoise pass.
+`manager_speech_clean.wav` is the final listening speech; by default it uses
+`input_matched` active loudness rather than a fixed -23 dBFS target, applies a
+true-peak style sample peak limiter, and removes residual/background-like bins.
+`manager_noise_residual_subtract.wav` is the conservative direct-subtraction
+residual. `manager_noise_residual_prefilter.wav` is the residual after the base
+manager suppression pass. `manager_noise_residual.wav` is the final listening
+residual: it uses `manager_speech_clean.wav` as a spectral guide, adds an extra
+manager-leak suppression pass, and is gently lifted toward -45 dBFS for easier
+listening.
 
 ## Known Limitations
 

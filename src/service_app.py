@@ -30,7 +30,9 @@ executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 ARTIFACTS = {
     "speech": "manager_speech_clean.wav",
+    "speech_prefilter": "manager_speech_clean_prefilter.wav",
     "noise": "manager_noise_residual.wav",
+    "noise_prefilter": "manager_noise_residual_prefilter.wav",
     "noise_subtract": "manager_noise_residual_subtract.wav",
     "raw_speech": "manager_speech_tse_raw.wav",
     "aligned_speech": "manager_speech_tse_aligned.wav",
@@ -71,7 +73,17 @@ class Defaults(BaseModel):
     speech_true_peak_db: float = -1.0
     speech_intro_duck_sec: float = 2.2
     speech_intro_lowpass_sec: float = 6.0
+    speech_noise_filter_strength: float = 0.78
+    speech_noise_filter_over_subtract: float = 1.35
+    speech_noise_filter_floor: float = 0.08
+    speech_noise_filter_mask_power: float = 1.0
+    speech_postfilter_max_gain_db: float = 4.0
+    residual_base_attenuation: float = 0.97
     residual_target_dbfs: float = -45.0
+    residual_leak_suppression: float = 0.94
+    residual_leak_mask_start_ratio: float = 0.18
+    residual_leak_mask_full_ratio: float = 0.68
+    residual_leak_mask_power: float = 0.50
     require_deepfilternet: bool = False
     auto_reference: bool = True
     auto_reference_sec: float = 20.0
@@ -132,7 +144,17 @@ async def create_job(
     speech_true_peak_db: float = Form(-1.0),
     speech_intro_duck_sec: float = Form(2.2),
     speech_intro_lowpass_sec: float = Form(6.0),
+    speech_noise_filter_strength: float = Form(0.78),
+    speech_noise_filter_over_subtract: float = Form(1.35),
+    speech_noise_filter_floor: float = Form(0.08),
+    speech_noise_filter_mask_power: float = Form(1.0),
+    speech_postfilter_max_gain_db: float = Form(4.0),
+    residual_base_attenuation: float = Form(0.97),
     residual_target_dbfs: float = Form(-45.0),
+    residual_leak_suppression: float = Form(0.94),
+    residual_leak_mask_start_ratio: float = Form(0.18),
+    residual_leak_mask_full_ratio: float = Form(0.68),
+    residual_leak_mask_power: float = Form(0.50),
     require_deepfilternet: bool = Form(False),
     auto_reference: bool = Form(True),
     auto_reference_sec: float = Form(20.0),
@@ -170,7 +192,17 @@ async def create_job(
         "speech_true_peak_db": speech_true_peak_db,
         "speech_intro_duck_sec": speech_intro_duck_sec,
         "speech_intro_lowpass_sec": speech_intro_lowpass_sec,
+        "speech_noise_filter_strength": speech_noise_filter_strength,
+        "speech_noise_filter_over_subtract": speech_noise_filter_over_subtract,
+        "speech_noise_filter_floor": speech_noise_filter_floor,
+        "speech_noise_filter_mask_power": speech_noise_filter_mask_power,
+        "speech_postfilter_max_gain_db": speech_postfilter_max_gain_db,
+        "residual_base_attenuation": residual_base_attenuation,
         "residual_target_dbfs": residual_target_dbfs,
+        "residual_leak_suppression": residual_leak_suppression,
+        "residual_leak_mask_start_ratio": residual_leak_mask_start_ratio,
+        "residual_leak_mask_full_ratio": residual_leak_mask_full_ratio,
+        "residual_leak_mask_power": residual_leak_mask_power,
         "require_deepfilternet": require_deepfilternet,
         "auto_reference": auto_reference,
         "auto_reference_sec": auto_reference_sec,
@@ -290,6 +322,7 @@ def _run_job(job_id: str) -> None:
     job_dir = RUNS_ROOT / job_id
     state = _read_json(job_dir / "job.json")
     started = time.time()
+    command_info = None
     _update_state(job_dir, {"status": "running", "started_at": _now()})
     try:
         settings = state["settings"]
@@ -341,6 +374,7 @@ def _run_job(job_id: str) -> None:
                 "finished_at": _now(),
                 "runtime_sec": time.time() - started,
                 "error": f"{type(exc).__name__}: {exc}",
+                "command": command_info,
             },
         )
 
@@ -377,8 +411,28 @@ def _build_process_command(input_file: Path, reference_file: Path, output_dir: P
         str(settings["speech_intro_duck_sec"]),
         "--speech-intro-lowpass-sec",
         str(settings["speech_intro_lowpass_sec"]),
+        "--speech-noise-filter-strength",
+        str(settings["speech_noise_filter_strength"]),
+        "--speech-noise-filter-over-subtract",
+        str(settings["speech_noise_filter_over_subtract"]),
+        "--speech-noise-filter-floor",
+        str(settings["speech_noise_filter_floor"]),
+        "--speech-noise-filter-mask-power",
+        str(settings["speech_noise_filter_mask_power"]),
+        "--speech-postfilter-max-gain-db",
+        str(settings["speech_postfilter_max_gain_db"]),
+        "--residual-base-attenuation",
+        str(settings["residual_base_attenuation"]),
         "--residual-target-dbfs",
         str(settings["residual_target_dbfs"]),
+        "--residual-leak-suppression",
+        str(settings["residual_leak_suppression"]),
+        "--residual-leak-mask-start-ratio",
+        str(settings["residual_leak_mask_start_ratio"]),
+        "--residual-leak-mask-full-ratio",
+        str(settings["residual_leak_mask_full_ratio"]),
+        "--residual-leak-mask-power",
+        str(settings["residual_leak_mask_power"]),
     ]
     if settings.get("disable_fallback"):
         cmd.append("--disable-fallback")
@@ -425,6 +479,9 @@ def _make_auto_reference(input_file: Path, output_file: Path, seconds: float) ->
 
 def _runtime_env() -> Dict[str, str]:
     env = os.environ.copy()
+    venv_bin = PROJECT_ROOT / ".venv" / "bin"
+    if venv_bin.exists():
+        env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
     env_file = PROJECT_ROOT / "env.tse"
     if not env_file.exists():
         env_file = PROJECT_ROOT / "env.tse.example"

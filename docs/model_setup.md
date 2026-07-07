@@ -38,13 +38,18 @@ The selected speech chain now keeps the intermediate stages:
 - `manager_speech_tse_aligned.wav` - delay-aligned TSE output.
 - `manager_speech_tse_gainmatched.wav` - aligned and loudness-matched to active
   input speech-like regions.
-- `manager_speech_clean.wav` - post-enhanced listening speech.
+- `manager_speech_clean_prefilter.wav` - post-enhanced speech before the final
+  residual-guided denoise pass.
+- `manager_speech_clean.wav` - final post-enhanced listening speech.
 
 By default speech loudness uses `input_matched`, not a fixed -23 dBFS target.
 When `pyloudnorm` is installed, active loudness uses BS.1770/LUFS; otherwise the
-pipeline falls back to active RMS dBFS. The final residual noise track,
-`manager_noise_residual.wav`, is built by strongly suppressing bins that look
-like the cleaned manager voice and is lifted toward -45 dBFS. The direct
+pipeline falls back to active RMS dBFS. The final speech file applies an extra
+residual-guided mask to reduce background that leaked through TSE. The final
+residual noise track, `manager_noise_residual.wav`, is built by strongly
+suppressing bins that look like the cleaned manager voice, then applies an extra
+manager-leak suppression pass and is lifted toward -45 dBFS. The prefilter
+residual is saved as `manager_noise_residual_prefilter.wav`; the direct
 subtraction audit file is preserved as `manager_noise_residual_subtract.wav`.
 
 In `quality=max`, DSP fallback is disabled unless `--allow-fallback` is passed.

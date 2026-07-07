@@ -30,7 +30,13 @@ from src.preprocess import (
     chunk_audio,
 )
 from src.reference import prepare_reference
-from src.residual import finalize_residual_for_listening, make_manager_suppressed_residual, make_residual
+from src.residual import (
+    denoise_speech_with_residual,
+    finalize_residual_for_listening,
+    make_manager_suppressed_residual,
+    make_residual,
+    suppress_residual_manager_leak,
+)
 from src.scoring import candidate_score
 
 
@@ -201,12 +207,57 @@ def main() -> int:
         max_gain_db=args.speech_max_gain_db,
         true_peak_db=args.speech_true_peak_db,
     )
+    write_wav(outdir / "manager_speech_clean_prefilter.wav", speech_clean, original_sr, subtype="PCM_16")
+
+    speech_noise_estimate, speech_noise_estimate_meta = make_manager_suppressed_residual(
+        original_aligned,
+        speech_clean,
+        original_sr,
+        attenuation=args.residual_base_attenuation,
+    )
+    speech_clean, speech_noise_filter_meta = denoise_speech_with_residual(
+        speech_clean,
+        speech_noise_estimate,
+        original_sr,
+        strength=args.speech_noise_filter_strength,
+        over_subtract=args.speech_noise_filter_over_subtract,
+        floor=args.speech_noise_filter_floor,
+        mask_power=args.speech_noise_filter_mask_power,
+    )
+    speech_clean, speech_postfilter_loudness_meta = match_loudness_to_input(
+        speech_clean,
+        original_aligned,
+        original_sr,
+        mode=args.speech_loudness_mode,
+        fixed_target_db=args.speech_target_dbfs,
+        max_gain_db=min(args.speech_max_gain_db, args.speech_postfilter_max_gain_db),
+        true_peak_db=args.speech_true_peak_db,
+    )
     write_wav(outdir / "manager_speech_clean.wav", speech_clean, original_sr, subtype="PCM_16")
+
     final_residual, suppression_meta = make_manager_suppressed_residual(
         original_aligned,
         speech_clean,
         original_sr,
-        attenuation=0.97,
+        attenuation=args.residual_base_attenuation,
+    )
+    residual_prefilter, residual_prefilter_gain_db = normalize_rms_asymmetric(
+        final_residual,
+        target_dbfs=args.residual_target_dbfs,
+        max_boost_db=6.0,
+        max_cut_db=30.0,
+    )
+    residual_prefilter = peak_limit(residual_prefilter, ceiling=0.85)
+    write_wav(outdir / "manager_noise_residual_prefilter.wav", residual_prefilter, original_sr, subtype="PCM_16")
+
+    final_residual, residual_leak_filter_meta = suppress_residual_manager_leak(
+        final_residual,
+        speech_clean,
+        original_sr,
+        attenuation=args.residual_leak_suppression,
+        mask_start_ratio=args.residual_leak_mask_start_ratio,
+        mask_full_ratio=args.residual_leak_mask_full_ratio,
+        mask_power=args.residual_leak_mask_power,
     )
     final_residual, residual_gain_db = normalize_rms_asymmetric(
         final_residual,
@@ -245,17 +296,22 @@ def main() -> int:
         "candidate_failures": candidate_failures,
         "residual": residual_meta,
         "residual_suppression": suppression_meta,
+        "speech_noise_estimate": speech_noise_estimate_meta,
+        "speech_noise_filter": speech_noise_filter_meta,
+        "residual_leak_filter": residual_leak_filter_meta,
         "tse_gain_matching": tse_gain_meta,
         "speech_enhancement": {
             **post_info,
             "intro_cleanup": speech_cleanup_meta,
-            "final_loudness": speech_loudness_meta,
+            "prefilter_loudness": speech_loudness_meta,
+            "final_loudness": speech_postfilter_loudness_meta,
             "final_loudness_mode": args.speech_loudness_mode,
             "final_target_dbfs_when_fixed": args.speech_target_dbfs,
             "final_output_dbfs": dbfs(speech_clean),
             "final_true_peak_db": args.speech_true_peak_db,
         },
         "residual_loudness": {
+            "prefilter_gain_db": residual_prefilter_gain_db,
             "final_gain_db": residual_gain_db,
             "final_target_dbfs": args.residual_target_dbfs,
             "final_output_dbfs": dbfs(final_residual),
@@ -307,7 +363,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--speech-true-peak-db", type=float, default=-1.0)
     parser.add_argument("--speech-intro-duck-sec", type=float, default=2.2)
     parser.add_argument("--speech-intro-lowpass-sec", type=float, default=6.0)
+    parser.add_argument("--speech-noise-filter-strength", type=float, default=0.78)
+    parser.add_argument("--speech-noise-filter-over-subtract", type=float, default=1.35)
+    parser.add_argument("--speech-noise-filter-floor", type=float, default=0.08)
+    parser.add_argument("--speech-noise-filter-mask-power", type=float, default=1.0)
+    parser.add_argument("--speech-postfilter-max-gain-db", type=float, default=4.0)
+    parser.add_argument("--residual-base-attenuation", type=float, default=0.97)
     parser.add_argument("--residual-target-dbfs", type=float, default=-45.0)
+    parser.add_argument("--residual-leak-suppression", type=float, default=0.94)
+    parser.add_argument("--residual-leak-mask-start-ratio", type=float, default=0.18)
+    parser.add_argument("--residual-leak-mask-full-ratio", type=float, default=0.68)
+    parser.add_argument("--residual-leak-mask-power", type=float, default=0.50)
     parser.add_argument("--require-deepfilternet", action="store_true")
     return parser
 
