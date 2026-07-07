@@ -28,7 +28,7 @@ RUNS_ROOT = Path(os.environ.get("AMS_RUNS_DIR", PROJECT_ROOT / "service_runs")).
 MAX_WORKERS = max(1, int(os.environ.get("AMS_MAX_WORKERS", "1")))
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-ARTIFACTS = {
+SINGLE_ARTIFACTS = {
     "speech": "manager_speech_clean.wav",
     "speech_prefilter": "manager_speech_clean_prefilter.wav",
     "noise": "manager_noise_residual.wav",
@@ -39,6 +39,18 @@ ARTIFACTS = {
     "gainmatched_speech": "manager_speech_tse_gainmatched.wav",
     "original": "original_aligned.wav",
     "report": "report.json",
+}
+DUAL_ARTIFACTS = {
+    "client": "client_audio.wav",
+    "client_raw": "client_audio_raw_iter0.wav",
+    "manager_side_estimate": "manager_side_estimate_in_mix.wav",
+    "manager_side_estimate_iter0": "manager_side_estimate_iter0.wav",
+    "manager_mic_no_client_leak": "manager_mic_no_client_leak.wav",
+    "client_leak_estimate": "client_leak_estimate_in_manager_mic.wav",
+    "aligned_call_mix": "aligned_call_mix.wav",
+    "aligned_manager_mic": "aligned_manager_mic.wav",
+    **SINGLE_ARTIFACTS,
+    "dual_prepare_report": "dual_prepare_report.json",
 }
 
 
@@ -84,6 +96,17 @@ class Defaults(BaseModel):
     residual_leak_mask_start_ratio: float = 0.18
     residual_leak_mask_full_ratio: float = 0.68
     residual_leak_mask_power: float = 0.50
+    dual_cancel_method: str = "hybrid"
+    dual_cancel_strength: float = 1.0
+    dual_spectral_strength: float = 0.35
+    dual_client_leak_strength: float = 0.80
+    dual_client_leak_spectral_strength: float = 0.20
+    dual_final_cancel_strength: float = 1.0
+    dual_final_spectral_strength: float = 0.35
+    dual_max_delay_ms: float = 3000.0
+    dual_drift_window_sec: float = 30.0
+    dual_drift_hop_sec: float = 15.0
+    dual_correct_drift: bool = False
     require_deepfilternet: bool = False
     auto_reference: bool = True
     auto_reference_sec: float = 20.0
@@ -227,6 +250,135 @@ async def create_job(
     )
 
 
+@app.post("/v1/jobs-dual", response_model=JobCreated, status_code=202)
+async def create_dual_job(
+    mix_audio: UploadFile = File(..., description="Common call mix: client + manager side"),
+    manager_mic_audio: UploadFile = File(..., description="Separate manager mic recording"),
+    reference: Optional[UploadFile] = File(None, description="Optional clean manager voice reference"),
+    device: str = Form("cuda:0"),
+    quality: str = Form("max"),
+    models: str = Form("wesep"),
+    disable_fallback: bool = Form(True),
+    chunk_sec: float = Form(25.0),
+    overlap_sec: float = Form(4.0),
+    highpass_hz: Optional[float] = Form(None),
+    dual_cancel_method: str = Form("hybrid"),
+    dual_cancel_strength: float = Form(1.0),
+    dual_spectral_strength: float = Form(0.35),
+    dual_client_leak_strength: float = Form(0.80),
+    dual_client_leak_spectral_strength: float = Form(0.20),
+    dual_final_cancel_strength: float = Form(1.0),
+    dual_final_spectral_strength: float = Form(0.35),
+    dual_max_delay_ms: float = Form(3000.0),
+    dual_drift_window_sec: float = Form(30.0),
+    dual_drift_hop_sec: float = Form(15.0),
+    dual_correct_drift: bool = Form(False),
+    speech_loudness_mode: str = Form("input_matched"),
+    speech_target_dbfs: float = Form(-23.0),
+    speech_max_gain_db: float = Form(18.0),
+    speech_true_peak_db: float = Form(-1.0),
+    speech_intro_duck_sec: float = Form(2.2),
+    speech_intro_lowpass_sec: float = Form(6.0),
+    speech_noise_filter_strength: float = Form(0.78),
+    speech_noise_filter_over_subtract: float = Form(1.35),
+    speech_noise_filter_floor: float = Form(0.08),
+    speech_noise_filter_mask_power: float = Form(1.0),
+    speech_postfilter_max_gain_db: float = Form(4.0),
+    residual_base_attenuation: float = Form(0.97),
+    residual_target_dbfs: float = Form(-45.0),
+    residual_leak_suppression: float = Form(0.94),
+    residual_leak_mask_start_ratio: float = Form(0.18),
+    residual_leak_mask_full_ratio: float = Form(0.68),
+    residual_leak_mask_power: float = Form(0.50),
+    require_deepfilternet: bool = Form(False),
+    auto_reference: bool = Form(True),
+    auto_reference_sec: float = Form(20.0),
+) -> JobCreated:
+    if not mix_audio.filename:
+        raise HTTPException(status_code=400, detail="mix_audio filename is required")
+    if not manager_mic_audio.filename:
+        raise HTTPException(status_code=400, detail="manager_mic_audio filename is required")
+    if reference is None and not auto_reference:
+        raise HTTPException(status_code=400, detail="reference is required when auto_reference=false")
+
+    RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+    job_id = uuid.uuid4().hex
+    job_dir = RUNS_ROOT / job_id
+    input_dir = job_dir / "input"
+    input_dir.mkdir(parents=True, exist_ok=False)
+
+    mix_path = input_dir / f"mix_{_safe_upload_name(mix_audio.filename, 'call_mix')}"
+    manager_mic_path = input_dir / f"manager_{_safe_upload_name(manager_mic_audio.filename, 'manager_mic')}"
+    await _save_upload(mix_audio, mix_path)
+    await _save_upload(manager_mic_audio, manager_mic_path)
+
+    reference_path = None
+    if reference is not None and reference.filename:
+        reference_path = input_dir / _safe_upload_name(reference.filename, "reference_audio")
+        await _save_upload(reference, reference_path)
+
+    settings = {
+        "device": device,
+        "quality": quality,
+        "models": models,
+        "disable_fallback": disable_fallback,
+        "chunk_sec": chunk_sec,
+        "overlap_sec": overlap_sec,
+        "highpass_hz": highpass_hz,
+        "dual_cancel_method": dual_cancel_method,
+        "dual_cancel_strength": dual_cancel_strength,
+        "dual_spectral_strength": dual_spectral_strength,
+        "dual_client_leak_strength": dual_client_leak_strength,
+        "dual_client_leak_spectral_strength": dual_client_leak_spectral_strength,
+        "dual_final_cancel_strength": dual_final_cancel_strength,
+        "dual_final_spectral_strength": dual_final_spectral_strength,
+        "dual_max_delay_ms": dual_max_delay_ms,
+        "dual_drift_window_sec": dual_drift_window_sec,
+        "dual_drift_hop_sec": dual_drift_hop_sec,
+        "dual_correct_drift": dual_correct_drift,
+        "speech_loudness_mode": speech_loudness_mode,
+        "speech_target_dbfs": speech_target_dbfs,
+        "speech_max_gain_db": speech_max_gain_db,
+        "speech_true_peak_db": speech_true_peak_db,
+        "speech_intro_duck_sec": speech_intro_duck_sec,
+        "speech_intro_lowpass_sec": speech_intro_lowpass_sec,
+        "speech_noise_filter_strength": speech_noise_filter_strength,
+        "speech_noise_filter_over_subtract": speech_noise_filter_over_subtract,
+        "speech_noise_filter_floor": speech_noise_filter_floor,
+        "speech_noise_filter_mask_power": speech_noise_filter_mask_power,
+        "speech_postfilter_max_gain_db": speech_postfilter_max_gain_db,
+        "residual_base_attenuation": residual_base_attenuation,
+        "residual_target_dbfs": residual_target_dbfs,
+        "residual_leak_suppression": residual_leak_suppression,
+        "residual_leak_mask_start_ratio": residual_leak_mask_start_ratio,
+        "residual_leak_mask_full_ratio": residual_leak_mask_full_ratio,
+        "residual_leak_mask_power": residual_leak_mask_power,
+        "require_deepfilternet": require_deepfilternet,
+        "auto_reference": auto_reference,
+        "auto_reference_sec": auto_reference_sec,
+    }
+    state = {
+        "job_id": job_id,
+        "mode": "mix_plus_manager_mic",
+        "status": "queued",
+        "created_at": _now(),
+        "updated_at": _now(),
+        "mix_file": str(mix_path),
+        "manager_mic_file": str(manager_mic_path),
+        "reference_file": str(reference_path) if reference_path else None,
+        "settings": settings,
+    }
+    _write_state(job_dir, state)
+    executor.submit(_run_dual_job, job_id)
+    return JobCreated(
+        job_id=job_id,
+        status="queued",
+        status_url=f"/v1/jobs/{job_id}",
+        report_url=f"/v1/jobs/{job_id}/report",
+        artifacts_url=f"/v1/jobs/{job_id}/artifacts",
+    )
+
+
 @app.get("/v1/jobs", response_model=List[JobSummary])
 def list_jobs(limit: int = 50) -> List[JobSummary]:
     if not RUNS_ROOT.exists():
@@ -259,7 +411,7 @@ def list_artifacts(job_id: str) -> Dict[str, Any]:
     state = _load_state(job_id)
     output_dir = Path(state.get("output_dir", ""))
     artifacts = {}
-    for key, filename in ARTIFACTS.items():
+    for key, filename in _artifacts_for_state(state).items():
         path = output_dir / filename
         artifacts[key] = {
             "filename": filename,
@@ -279,7 +431,7 @@ def download_artifact(job_id: str, artifact: str) -> FileResponse:
     state = _load_state(job_id)
     if state["status"] != "succeeded":
         raise HTTPException(status_code=409, detail="job is not finished")
-    filename = ARTIFACTS.get(artifact)
+    filename = _artifacts_for_state(state).get(artifact)
     if not filename:
         raise HTTPException(status_code=404, detail="unknown artifact")
     path = Path(state["output_dir"]) / filename
@@ -296,7 +448,7 @@ def download_zip(job_id: str) -> FileResponse:
         raise HTTPException(status_code=409, detail="job is not finished")
     zip_path = Path(state["job_dir"]) / "artifacts.zip"
     if not zip_path.exists():
-        _make_zip(Path(state["output_dir"]), zip_path)
+        _make_zip(Path(state["output_dir"]), zip_path, _artifacts_for_state(state))
     return FileResponse(zip_path, media_type="application/zip", filename=f"{job_id}_artifacts.zip")
 
 
@@ -354,7 +506,7 @@ def _run_job(job_id: str) -> None:
             raise RuntimeError(f"process_call.py failed with code {completed.returncode}")
 
         report = _read_json(output_dir / "report.json")
-        _make_zip(output_dir, job_dir / "artifacts.zip")
+        _make_zip(output_dir, job_dir / "artifacts.zip", SINGLE_ARTIFACTS)
         _update_state(
             job_dir,
             {
@@ -363,6 +515,69 @@ def _run_job(job_id: str) -> None:
                 "runtime_sec": time.time() - started,
                 "output_dir": str(output_dir),
                 "selected_tse_model": report.get("selected_tse_model"),
+                "command": command_info,
+            },
+        )
+    except Exception as exc:
+        _update_state(
+            job_dir,
+            {
+                "status": "failed",
+                "finished_at": _now(),
+                "runtime_sec": time.time() - started,
+                "error": f"{type(exc).__name__}: {exc}",
+                "command": command_info,
+            },
+        )
+
+
+def _run_dual_job(job_id: str) -> None:
+    job_dir = RUNS_ROOT / job_id
+    state = _read_json(job_dir / "job.json")
+    started = time.time()
+    command_info = None
+    _update_state(job_dir, {"status": "running", "started_at": _now()})
+    try:
+        settings = state["settings"]
+        mix_file = Path(state["mix_file"])
+        manager_mic_file = Path(state["manager_mic_file"])
+        reference_file = Path(state["reference_file"]) if state.get("reference_file") else None
+        if reference_file is None:
+            reference_file = job_dir / "input" / "reference_auto.wav"
+            ref_meta = _make_auto_reference(manager_mic_file, reference_file, float(settings["auto_reference_sec"]))
+            _update_state(job_dir, {"reference_file": str(reference_file), "auto_reference": ref_meta})
+
+        output_dir = job_dir / "output"
+        cmd = _build_dual_process_command(mix_file, manager_mic_file, reference_file, output_dir, settings)
+        env = _runtime_env()
+        completed = subprocess.run(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        command_info = {
+            "argv": cmd,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout[-12000:],
+            "stderr": completed.stderr[-12000:],
+        }
+        if completed.returncode != 0:
+            raise RuntimeError(f"process_dual_input.py failed with code {completed.returncode}")
+
+        report = _read_json(output_dir / "report.json")
+        _make_zip(output_dir, job_dir / "artifacts.zip", DUAL_ARTIFACTS)
+        manager_separation = report.get("manager_separation", {})
+        _update_state(
+            job_dir,
+            {
+                "status": "succeeded",
+                "finished_at": _now(),
+                "runtime_sec": time.time() - started,
+                "output_dir": str(output_dir),
+                "selected_tse_model": manager_separation.get("selected_tse_model"),
                 "command": command_info,
             },
         )
@@ -443,6 +658,100 @@ def _build_process_command(input_file: Path, reference_file: Path, output_dir: P
     return cmd
 
 
+def _build_dual_process_command(
+    mix_file: Path,
+    manager_mic_file: Path,
+    reference_file: Path,
+    output_dir: Path,
+    settings: Dict[str, Any],
+) -> List[str]:
+    cmd = [
+        sys.executable,
+        str(PROJECT_ROOT / "process_dual_input.py"),
+        "--mix",
+        str(mix_file),
+        "--manager-mic",
+        str(manager_mic_file),
+        "--reference",
+        str(reference_file),
+        "--outdir",
+        str(output_dir),
+        "--device",
+        str(settings["device"]),
+        "--quality",
+        str(settings["quality"]),
+        "--models",
+        str(settings["models"]),
+        "--chunk-sec",
+        str(settings["chunk_sec"]),
+        "--overlap-sec",
+        str(settings["overlap_sec"]),
+        "--dual-cancel-method",
+        str(settings["dual_cancel_method"]),
+        "--dual-cancel-strength",
+        str(settings["dual_cancel_strength"]),
+        "--dual-spectral-strength",
+        str(settings["dual_spectral_strength"]),
+        "--dual-client-leak-strength",
+        str(settings["dual_client_leak_strength"]),
+        "--dual-client-leak-spectral-strength",
+        str(settings["dual_client_leak_spectral_strength"]),
+        "--dual-final-cancel-strength",
+        str(settings["dual_final_cancel_strength"]),
+        "--dual-final-spectral-strength",
+        str(settings["dual_final_spectral_strength"]),
+        "--dual-max-delay-ms",
+        str(settings["dual_max_delay_ms"]),
+        "--dual-drift-window-sec",
+        str(settings["dual_drift_window_sec"]),
+        "--dual-drift-hop-sec",
+        str(settings["dual_drift_hop_sec"]),
+        "--speech-loudness-mode",
+        str(settings["speech_loudness_mode"]),
+        "--speech-target-dbfs",
+        str(settings["speech_target_dbfs"]),
+        "--speech-max-gain-db",
+        str(settings["speech_max_gain_db"]),
+        "--speech-true-peak-db",
+        str(settings["speech_true_peak_db"]),
+        "--speech-intro-duck-sec",
+        str(settings["speech_intro_duck_sec"]),
+        "--speech-intro-lowpass-sec",
+        str(settings["speech_intro_lowpass_sec"]),
+        "--speech-noise-filter-strength",
+        str(settings["speech_noise_filter_strength"]),
+        "--speech-noise-filter-over-subtract",
+        str(settings["speech_noise_filter_over_subtract"]),
+        "--speech-noise-filter-floor",
+        str(settings["speech_noise_filter_floor"]),
+        "--speech-noise-filter-mask-power",
+        str(settings["speech_noise_filter_mask_power"]),
+        "--speech-postfilter-max-gain-db",
+        str(settings["speech_postfilter_max_gain_db"]),
+        "--residual-base-attenuation",
+        str(settings["residual_base_attenuation"]),
+        "--residual-target-dbfs",
+        str(settings["residual_target_dbfs"]),
+        "--residual-leak-suppression",
+        str(settings["residual_leak_suppression"]),
+        "--residual-leak-mask-start-ratio",
+        str(settings["residual_leak_mask_start_ratio"]),
+        "--residual-leak-mask-full-ratio",
+        str(settings["residual_leak_mask_full_ratio"]),
+        "--residual-leak-mask-power",
+        str(settings["residual_leak_mask_power"]),
+    ]
+    if settings.get("disable_fallback"):
+        cmd.append("--disable-fallback")
+    if settings.get("require_deepfilternet"):
+        cmd.append("--require-deepfilternet")
+    if settings.get("dual_correct_drift"):
+        cmd.append("--dual-correct-drift")
+    if settings.get("highpass_hz") is not None:
+        cmd.extend(["--highpass-hz", str(settings["highpass_hz"])])
+    return cmd
+
+
 def _make_auto_reference(input_file: Path, output_file: Path, seconds: float) -> Dict[str, Any]:
     audio, sr = read_audio(input_file, mono=True)
     cleaned, prep = preprocess_audio(audio, sr, highpass_hz=60.0, normalize=True, target_dbfs=-24.0)
@@ -508,9 +817,15 @@ def _parse_export_env(path: Path) -> Dict[str, str]:
     return values
 
 
-def _make_zip(output_dir: Path, zip_path: Path) -> None:
+def _artifacts_for_state(state: Dict[str, Any]) -> Dict[str, str]:
+    if state.get("mode") == "mix_plus_manager_mic":
+        return DUAL_ARTIFACTS
+    return SINGLE_ARTIFACTS
+
+
+def _make_zip(output_dir: Path, zip_path: Path, artifacts: Dict[str, str]) -> None:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for name in ARTIFACTS.values():
+        for name in artifacts.values():
             path = output_dir / name
             if path.exists():
                 zf.write(path, arcname=name)

@@ -120,12 +120,36 @@ python service.py --host 0.0.0.0 --port 8088
 Main endpoints:
 
 - `POST /v1/jobs` - upload audio and optional manager reference.
+- `POST /v1/jobs-dual` - upload call mix + separate manager mic + optional manager reference.
 - `GET /v1/jobs/{job_id}` - check status.
+- `GET /v1/jobs/{job_id}/artifacts/client` - download `client_audio.wav` for dual jobs.
 - `GET /v1/jobs/{job_id}/artifacts/speech` - download `manager_speech_clean.wav`.
 - `GET /v1/jobs/{job_id}/artifacts/noise` - download `manager_noise_residual.wav`.
 - `GET /v1/jobs/{job_id}/artifacts.zip` - download all artifacts.
 
 Russian API documentation: `docs/service_api_ru.md`.
+
+## Dual Input Mode
+
+Use this mode when you have both a common call mix and a separate manager
+microphone track:
+
+```bash
+python process_dual_input.py \
+  --mix input/call_mix.wav \
+  --manager-mic input/manager_mic.wav \
+  --reference input/manager_reference_clean.wav \
+  --outdir output_dual \
+  --device cuda:0 \
+  --quality max \
+  --models wesep \
+  --disable-fallback
+```
+
+The dual pipeline writes `client_audio.wav`, `manager_speech_clean.wav`, and
+`manager_noise_residual.wav`. It first uses the manager mic as a reference to
+cancel the manager side from the call mix, then removes the rough client track
+from the manager mic before running the existing target-speaker pipeline.
 
 ## Benchmark
 
@@ -172,6 +196,17 @@ output/manager_noise_residual.wav
 output/report.json
 output/candidates/*.wav
 output/references/*.wav
+```
+
+Dual-input runs additionally write:
+
+```text
+output/client_audio.wav
+output/client_audio_raw_iter0.wav
+output/manager_mic_no_client_leak.wav
+output/manager_side_estimate_in_mix.wav
+output/client_leak_estimate_in_manager_mic.wav
+output/dual_prepare_report.json
 ```
 
 `manager_speech_tse_aligned.wav` is the selected TSE output after delay

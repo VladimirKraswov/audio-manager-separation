@@ -56,6 +56,15 @@ In `quality=max`, DSP fallback is disabled unless `--allow-fallback` is passed.
 If DeepFilterNet is not installed, the pipeline records a warning and uses the
 built-in postprocess; pass `--require-deepfilternet` to fail instead.
 
+## Dual Input Mode
+
+When a common call mix and a separate manager mic are available, run
+`process_dual_input.py`. This mode first aligns both recordings, uses the
+manager mic as a reference to cancel the manager side from the call mix, removes
+the rough client estimate from the manager mic, and only then runs the same TSE
+chain described above. The TSE model setup does not change; dual-input simply
+feeds it a cleaner `manager_mic_no_client_leak.wav`.
+
 ## Smoke Tests
 
 ```bash

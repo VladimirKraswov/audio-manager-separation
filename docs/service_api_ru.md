@@ -136,6 +136,56 @@ curl -X POST http://localhost:8088/v1/jobs \
 }
 ```
 
+## Создать dual-input задачу
+
+Этот режим стоит использовать, если есть два файла:
+
+```text
+call_mix.wav      - общий микс: клиент + менеджер + фон
+manager_mic.wav   - отдельный микрофон менеджера
+```
+
+Минимальный запрос:
+
+```bash
+curl -X POST http://localhost:8088/v1/jobs-dual \
+  -F "mix_audio=@call_mix.wav" \
+  -F "manager_mic_audio=@manager_mic.wav"
+```
+
+Если чистый reference менеджера есть отдельно, лучше передать его:
+
+```bash
+curl -X POST http://localhost:8088/v1/jobs-dual \
+  -F "mix_audio=@call_mix.wav" \
+  -F "manager_mic_audio=@manager_mic.wav" \
+  -F "reference=@manager_reference.wav"
+```
+
+Ручки качества dual-input:
+
+| параметр | дефолт | смысл |
+|---|---:|---|
+| `dual_cancel_method` | `hybrid` | `simple`, `adaptive_fir`, `spectral_mask`, `hybrid` |
+| `dual_cancel_strength` | `1.0` | сила удаления manager mic из общего микса на первой итерации |
+| `dual_spectral_strength` | `0.35` | мягкая spectral-mask дочистка клиента |
+| `dual_client_leak_strength` | `0.80` | сила удаления грубого клиента из manager mic |
+| `dual_final_cancel_strength` | `1.0` | финальное удаление очищенного manager mic из общего микса |
+| `dual_max_delay_ms` | `3000.0` | максимум поиска задержки между файлами |
+| `dual_correct_drift` | `false` | включать только для длинных файлов с заметным drift |
+
+Главные выходы dual-input:
+
+| ключ | файл | назначение |
+|---|---|---|
+| `client` | `client_audio.wav` | клиентская сторона из общего микса |
+| `client_raw` | `client_audio_raw_iter0.wav` | первая грубая оценка клиента |
+| `manager_mic_no_client_leak` | `manager_mic_no_client_leak.wav` | manager mic после удаления утечки клиента |
+| `manager_side_estimate` | `manager_side_estimate_in_mix.wav` | оценка стороны менеджера в общем миксе |
+| `speech` | `manager_speech_clean.wav` | чистая речь менеджера |
+| `noise` | `manager_noise_residual.wav` | шумы на стороне менеджера |
+| `report` | `report.json` | полный dual-input отчёт |
+
 ## Статус задачи
 
 ```bash
@@ -223,6 +273,14 @@ curl -X DELETE http://localhost:8088/v1/jobs/<job_id>
 - Если в шумовом треке всё ещё слышен менеджер, лучше сначала улучшить reference.
   Auto-reference удобен для черновой обработки, но отдельный чистый reference
   обычно даёт более стабильное разделение.
+- Если есть общий микс и отдельный manager mic, используйте `/v1/jobs-dual`:
+  это качественнее для `client_audio.wav`, потому что manager mic становится
+  полноценным reference-track для cancellation.
+- Если в `client_audio.wav` остаётся менеджер, поднимите
+  `dual_spectral_strength` до `0.45-0.60`; если клиент становится водянистым,
+  верните ближе к `0.25-0.35`.
+- Если в `manager_noise_residual.wav` слышен клиент из колонок менеджера,
+  поднимите `dual_client_leak_strength` до `0.9`.
 
 ## Ограничения текущей версии
 
