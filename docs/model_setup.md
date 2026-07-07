@@ -32,12 +32,24 @@ The placeholders available to every command template are:
 
 ## Residual Noise Track
 
-The selected speech output is `manager_speech_clean.wav`. It gets a short intro
-cleanup pass for applause-like transients, then is normalized for listening
-around -23 dBFS and peak-limited. The final residual noise track,
+The selected speech chain now keeps the intermediate stages:
+
+- `manager_speech_tse_raw.wav` - direct selected TSE output.
+- `manager_speech_tse_aligned.wav` - delay-aligned TSE output.
+- `manager_speech_tse_gainmatched.wav` - aligned and loudness-matched to active
+  input speech-like regions.
+- `manager_speech_clean.wav` - post-enhanced listening speech.
+
+By default speech loudness uses `input_matched`, not a fixed -23 dBFS target.
+When `pyloudnorm` is installed, active loudness uses BS.1770/LUFS; otherwise the
+pipeline falls back to active RMS dBFS. The final residual noise track,
 `manager_noise_residual.wav`, is built by strongly suppressing bins that look
-like this cleaned manager voice and is lifted toward -45 dBFS. The direct
+like the cleaned manager voice and is lifted toward -45 dBFS. The direct
 subtraction audit file is preserved as `manager_noise_residual_subtract.wav`.
+
+In `quality=max`, DSP fallback is disabled unless `--allow-fallback` is passed.
+If DeepFilterNet is not installed, the pipeline records a warning and uses the
+built-in postprocess; pass `--require-deepfilternet` to fail instead.
 
 ## Smoke Tests
 

@@ -11,7 +11,9 @@ from typing import Callable, Dict, List, Tuple
 
 import numpy as np
 
+from src.alignment import estimate_delay_samples, shift_to_align_estimate
 from src.audio_io import dbfs, match_length, peak_limit, read_audio, resample_audio, write_wav
+from src.loudness import match_loudness_to_input
 from src.models.base import ModelUnavailableError
 from src.models.clearvoice_tse import run_clearvoice_tse
 from src.models.deepfilternet import enhance_speech
@@ -23,7 +25,6 @@ from src.preprocess import (
     cleanup_manager_speech_intro,
     describe_chunks,
     normalize_rms_asymmetric,
-    normalize_rms,
     overlap_add,
     preprocess_audio,
     chunk_audio,
@@ -89,8 +90,13 @@ def main() -> int:
     reference_info = prepare_reference(reference, original_sr, refs_dir)
     warnings.extend(reference_info.get("warnings", []))
 
+    disable_fallback = args.disable_fallback or (args.quality == "max" and not args.allow_fallback)
     model_names = [name.strip().lower() for name in args.models.split(",") if name.strip()]
-    if "fallback" not in model_names and not args.disable_fallback:
+    if disable_fallback:
+        model_names = [name for name in model_names if name != "fallback"]
+    if not model_names:
+        raise RuntimeError("No TSE models requested after disabling fallback")
+    if "fallback" not in model_names and not disable_fallback:
         model_names.append("fallback")
 
     candidate_paths: Dict[str, Path] = {}
@@ -134,13 +140,50 @@ def main() -> int:
     selected_speech = match_length(selected_speech, len(original_aligned))
     write_wav(outdir / "manager_speech_tse_raw.wav", selected_speech, original_sr, subtype="FLOAT", prevent_clip=False)
 
-    residual_raw, aligned_speech, residual_meta = make_residual(original_aligned, selected_speech, original_sr)
+    tse_delay, tse_corr = estimate_delay_samples(original_aligned, selected_speech, original_sr)
+    selected_speech_aligned = shift_to_align_estimate(selected_speech, tse_delay, len(original_aligned))
+    write_wav(
+        outdir / "manager_speech_tse_aligned.wav",
+        selected_speech_aligned,
+        original_sr,
+        subtype="FLOAT",
+        prevent_clip=False,
+    )
+    selected_speech_gainmatched, tse_gain_meta = match_loudness_to_input(
+        selected_speech_aligned,
+        original_aligned,
+        original_sr,
+        mode=args.speech_loudness_mode,
+        fixed_target_db=args.speech_target_dbfs,
+        max_gain_db=args.speech_max_gain_db,
+        true_peak_db=args.speech_true_peak_db,
+    )
+    tse_gain_meta["alignment_delay_samples"] = tse_delay
+    tse_gain_meta["alignment_delay_ms"] = tse_delay * 1000.0 / float(original_sr)
+    tse_gain_meta["alignment_correlation"] = tse_corr
+    write_wav(
+        outdir / "manager_speech_tse_gainmatched.wav",
+        selected_speech_gainmatched,
+        original_sr,
+        subtype="FLOAT",
+        prevent_clip=False,
+    )
+
+    residual_raw, aligned_speech, residual_meta = make_residual(original_aligned, selected_speech_gainmatched, original_sr)
     write_wav(outdir / "manager_noise_residual_raw.wav", residual_raw, original_sr, subtype="FLOAT", prevent_clip=False)
     subtract_residual = finalize_residual_for_listening(residual_raw)
     write_wav(outdir / "manager_noise_residual_subtract.wav", subtract_residual, original_sr, subtype="PCM_16")
 
     post_path = candidates_dir / "manager_speech_deepfilternet.wav"
-    post_info = enhance_speech(outdir / "manager_speech_tse_raw.wav", post_path, original_sr, device=args.device)
+    post_info = enhance_speech(
+        outdir / "manager_speech_tse_gainmatched.wav",
+        post_path,
+        original_sr,
+        device=args.device,
+        require_real=args.require_deepfilternet,
+    )
+    if post_info.get("mode") == "fallback":
+        warnings.append("deepfilternet_unavailable_builtin_postprocess_used")
     speech_clean, _ = read_audio(post_path, target_sr=original_sr, mono=True)
     speech_clean = peak_limit(match_length(speech_clean, len(original_aligned)))
     speech_clean, speech_cleanup_meta = cleanup_manager_speech_intro(
@@ -149,12 +192,15 @@ def main() -> int:
         duck_sec=args.speech_intro_duck_sec,
         lowpass_sec=args.speech_intro_lowpass_sec,
     )
-    speech_clean, speech_gain_db = normalize_rms(
+    speech_clean, speech_loudness_meta = match_loudness_to_input(
         speech_clean,
-        target_dbfs=args.speech_target_dbfs,
-        max_gain_db=32.0,
+        original_aligned,
+        original_sr,
+        mode=args.speech_loudness_mode,
+        fixed_target_db=args.speech_target_dbfs,
+        max_gain_db=args.speech_max_gain_db,
+        true_peak_db=args.speech_true_peak_db,
     )
-    speech_clean = peak_limit(speech_clean, ceiling=0.95)
     write_wav(outdir / "manager_speech_clean.wav", speech_clean, original_sr, subtype="PCM_16")
     final_residual, suppression_meta = make_manager_suppressed_residual(
         original_aligned,
@@ -199,13 +245,15 @@ def main() -> int:
         "candidate_failures": candidate_failures,
         "residual": residual_meta,
         "residual_suppression": suppression_meta,
+        "tse_gain_matching": tse_gain_meta,
         "speech_enhancement": {
             **post_info,
             "intro_cleanup": speech_cleanup_meta,
-            "final_gain_db": speech_gain_db,
-            "final_target_dbfs": args.speech_target_dbfs,
+            "final_loudness": speech_loudness_meta,
+            "final_loudness_mode": args.speech_loudness_mode,
+            "final_target_dbfs_when_fixed": args.speech_target_dbfs,
             "final_output_dbfs": dbfs(speech_clean),
-            "final_peak_ceiling": 0.95,
+            "final_true_peak_db": args.speech_true_peak_db,
         },
         "residual_loudness": {
             "final_gain_db": residual_gain_db,
@@ -223,6 +271,12 @@ def main() -> int:
             "proxy_overall": final_score["overall"],
         },
         "warnings": warnings,
+        "quality_readiness": {
+            "fallback_disabled": disable_fallback,
+            "real_tse_selected": selected_model != "fallback",
+            "real_speech_enhancement": post_info.get("model") == "deepfilternet",
+            "deepfilternet_required": args.require_deepfilternet,
+        },
         "runtime_sec": time.time() - started,
     }
     write_json(outdir / "report.json", report)
@@ -243,13 +297,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated TSE candidates: wesep,clearvoice,metis,llase,fallback",
     )
     parser.add_argument("--disable-fallback", action="store_true", help="Fail if configured TSE models are unavailable")
+    parser.add_argument("--allow-fallback", action="store_true", help="Allow DSP fallback even when --quality=max")
     parser.add_argument("--chunk-sec", type=float, default=25.0)
     parser.add_argument("--overlap-sec", type=float, default=4.0)
     parser.add_argument("--highpass-hz", type=float, default=None)
+    parser.add_argument("--speech-loudness-mode", default="input_matched", choices=["input_matched", "fixed"])
     parser.add_argument("--speech-target-dbfs", type=float, default=-23.0)
+    parser.add_argument("--speech-max-gain-db", type=float, default=18.0)
+    parser.add_argument("--speech-true-peak-db", type=float, default=-1.0)
     parser.add_argument("--speech-intro-duck-sec", type=float, default=2.2)
     parser.add_argument("--speech-intro-lowpass-sec", type=float, default=6.0)
     parser.add_argument("--residual-target-dbfs", type=float, default=-45.0)
+    parser.add_argument("--require-deepfilternet", action="store_true")
     return parser
 
 

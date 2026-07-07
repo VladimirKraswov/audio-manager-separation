@@ -33,6 +33,8 @@ ARTIFACTS = {
     "noise": "manager_noise_residual.wav",
     "noise_subtract": "manager_noise_residual_subtract.wav",
     "raw_speech": "manager_speech_tse_raw.wav",
+    "aligned_speech": "manager_speech_tse_aligned.wav",
+    "gainmatched_speech": "manager_speech_tse_gainmatched.wav",
     "original": "original_aligned.wav",
     "report": "report.json",
 }
@@ -63,10 +65,14 @@ class Defaults(BaseModel):
     disable_fallback: bool = True
     chunk_sec: float = 25.0
     overlap_sec: float = 4.0
+    speech_loudness_mode: str = "input_matched"
     speech_target_dbfs: float = -23.0
+    speech_max_gain_db: float = 18.0
+    speech_true_peak_db: float = -1.0
     speech_intro_duck_sec: float = 2.2
     speech_intro_lowpass_sec: float = 6.0
     residual_target_dbfs: float = -45.0
+    require_deepfilternet: bool = False
     auto_reference: bool = True
     auto_reference_sec: float = 20.0
 
@@ -91,12 +97,16 @@ def root() -> Dict[str, Any]:
 @app.get("/health")
 def health() -> Dict[str, Any]:
     env = _runtime_env()
+    deepfilternet_available = bool(env.get("DEEPFILTERNET_CMD") or shutil.which("deepFilter"))
+    wesep_configured = bool(env.get("WESEP_TSE_CMD"))
     return {
         "status": "ok",
         "project_root": str(PROJECT_ROOT),
         "runs_root": str(RUNS_ROOT),
         "max_workers": MAX_WORKERS,
-        "wesep_configured": bool(env.get("WESEP_TSE_CMD")),
+        "wesep_configured": wesep_configured,
+        "deepfilternet_available": deepfilternet_available,
+        "ready_for_quality_processing": bool(wesep_configured and deepfilternet_available),
     }
 
 
@@ -116,10 +126,14 @@ async def create_job(
     chunk_sec: float = Form(25.0),
     overlap_sec: float = Form(4.0),
     highpass_hz: Optional[float] = Form(None),
+    speech_loudness_mode: str = Form("input_matched"),
     speech_target_dbfs: float = Form(-23.0),
+    speech_max_gain_db: float = Form(18.0),
+    speech_true_peak_db: float = Form(-1.0),
     speech_intro_duck_sec: float = Form(2.2),
     speech_intro_lowpass_sec: float = Form(6.0),
     residual_target_dbfs: float = Form(-45.0),
+    require_deepfilternet: bool = Form(False),
     auto_reference: bool = Form(True),
     auto_reference_sec: float = Form(20.0),
 ) -> JobCreated:
@@ -150,10 +164,14 @@ async def create_job(
         "chunk_sec": chunk_sec,
         "overlap_sec": overlap_sec,
         "highpass_hz": highpass_hz,
+        "speech_loudness_mode": speech_loudness_mode,
         "speech_target_dbfs": speech_target_dbfs,
+        "speech_max_gain_db": speech_max_gain_db,
+        "speech_true_peak_db": speech_true_peak_db,
         "speech_intro_duck_sec": speech_intro_duck_sec,
         "speech_intro_lowpass_sec": speech_intro_lowpass_sec,
         "residual_target_dbfs": residual_target_dbfs,
+        "require_deepfilternet": require_deepfilternet,
         "auto_reference": auto_reference,
         "auto_reference_sec": auto_reference_sec,
     }
@@ -347,8 +365,14 @@ def _build_process_command(input_file: Path, reference_file: Path, output_dir: P
         str(settings["chunk_sec"]),
         "--overlap-sec",
         str(settings["overlap_sec"]),
+        "--speech-loudness-mode",
+        str(settings["speech_loudness_mode"]),
         "--speech-target-dbfs",
         str(settings["speech_target_dbfs"]),
+        "--speech-max-gain-db",
+        str(settings["speech_max_gain_db"]),
+        "--speech-true-peak-db",
+        str(settings["speech_true_peak_db"]),
         "--speech-intro-duck-sec",
         str(settings["speech_intro_duck_sec"]),
         "--speech-intro-lowpass-sec",
@@ -358,6 +382,8 @@ def _build_process_command(input_file: Path, reference_file: Path, output_dir: P
     ]
     if settings.get("disable_fallback"):
         cmd.append("--disable-fallback")
+    if settings.get("require_deepfilternet"):
+        cmd.append("--require-deepfilternet")
     if settings.get("highpass_hz") is not None:
         cmd.extend(["--highpass-hz", str(settings["highpass_hz"])])
     return cmd

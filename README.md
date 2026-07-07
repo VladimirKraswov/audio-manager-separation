@@ -159,6 +159,8 @@ Every run writes:
 ```text
 output/original_aligned.wav
 output/manager_speech_tse_raw.wav
+output/manager_speech_tse_aligned.wav
+output/manager_speech_tse_gainmatched.wav
 output/manager_speech_clean.wav
 output/manager_noise_residual_raw.wav
 output/manager_noise_residual_subtract.wav
@@ -168,9 +170,12 @@ output/candidates/*.wav
 output/references/*.wav
 ```
 
-`manager_speech_clean.wav` gets a short intro cleanup pass for applause-like
-transients, then is normalized for listening around -23 dBFS with a peak
-limiter. `manager_noise_residual_subtract.wav` is the conservative
+`manager_speech_tse_aligned.wav` is the selected TSE output after delay
+alignment. `manager_speech_tse_gainmatched.wav` is aligned and loudness-matched
+to active speech-like regions in the input. `manager_speech_clean.wav` is the
+post-enhanced listening speech; by default it uses `input_matched` active
+loudness rather than a fixed -23 dBFS target, then applies a true-peak style
+sample peak limiter. `manager_noise_residual_subtract.wav` is the conservative
 direct-subtraction residual. `manager_noise_residual.wav` is the listening
 residual: it uses `manager_speech_clean.wav` as a spectral guide, aggressively
 suppresses bins that look like the manager's voice, and is gently lifted toward
@@ -180,6 +185,10 @@ suppresses bins that look like the manager's voice, and is gently lifted toward
 
 - Real production quality depends on installing and validating the selected
   WeSep runtime on representative calls.
+- In `quality=max`, DSP fallback is disabled unless `--allow-fallback` is passed.
+- If DeepFilterNet is unavailable, the report now records
+  `deepfilternet_unavailable_builtin_postprocess_used`; pass
+  `--require-deepfilternet` to fail instead.
 - Built-in scoring metrics are proxies. Add SpeechBrain embeddings, DNSMOS/NISQA,
   and ASR confidence before making production decisions.
 - Direct residual subtraction is only physically meaningful when the selected TSE

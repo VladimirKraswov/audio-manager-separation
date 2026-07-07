@@ -17,6 +17,7 @@ def enhance_speech(
     sr: int,
     *,
     device: str = "cpu",
+    require_real: bool = False,
 ) -> dict:
     """Run DeepFilterNet if configured, else apply a mild deterministic polish."""
     input_wav_path = Path(input_wav_path)
@@ -38,6 +39,9 @@ def enhance_speech(
             audio, produced_sr = read_audio(produced[0], target_sr=sr)
             write_wav(output_wav_path, audio, produced_sr, subtype="PCM_16")
             return {"model": "deepfilternet", "mode": "deepFilter_cli"}
+
+    if require_real:
+        raise RuntimeError("DeepFilterNet is required but DEEPFILTERNET_CMD/deepFilter is unavailable")
 
     audio, file_sr = read_audio(input_wav_path, target_sr=sr)
     polished = mild_post_enhance(audio, sr)

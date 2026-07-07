@@ -37,9 +37,16 @@ curl http://localhost:8088/health
   "project_root": "/home/vladimir/audio_manager_separation",
   "runs_root": "/home/vladimir/audio_manager_separation/service_runs",
   "max_workers": 1,
-  "wesep_configured": true
+  "wesep_configured": true,
+  "deepfilternet_available": false,
+  "ready_for_quality_processing": false
 }
 ```
+
+`ready_for_quality_processing=true` означает, что настроены и реальный WeSep, и
+реальный DeepFilterNet. Если DeepFilterNet не установлен, сервис всё равно может
+работать, но `report.json` явно получит warning
+`deepfilternet_unavailable_builtin_postprocess_used`.
 
 ## Дефолтные настройки
 
@@ -55,12 +62,22 @@ curl http://localhost:8088/v1/defaults
 | `models` | `wesep` | использовать только выбранный WeSep-подход |
 | `disable_fallback` | `true` | не подменять WeSep простым DSP fallback |
 | `device` | `cuda:0` | GPU для инференса |
-| `speech_target_dbfs` | `-23.0` | громкость чистого голоса |
+| `speech_loudness_mode` | `input_matched` | матчить громкость речи к активным участкам входа |
+| `speech_target_dbfs` | `-23.0` | используется только в режиме `fixed` |
+| `speech_max_gain_db` | `18.0` | максимум усиления речи |
+| `speech_true_peak_db` | `-1.0` | потолок пиков речи |
 | `speech_intro_duck_sec` | `2.2` | приглушение первых секунд, где часто лезут хлопки/аплодисменты |
 | `speech_intro_lowpass_sec` | `6.0` | мягкая фильтрация начала чистого голоса |
 | `residual_target_dbfs` | `-45.0` | громкость шумового трека |
+| `require_deepfilternet` | `false` | если `true`, job падает без реального DeepFilterNet |
 | `auto_reference` | `true` | если reference не передан, взять лучший 20-секундный участок из входа |
 | `auto_reference_sec` | `20.0` | длина auto-reference |
+
+`input_matched` не нормализует речь в фиксированные `-23 dBFS`. Сервис берёт
+активные speech-like участки извлечённого менеджера, измеряет те же участки во
+входном аудио и применяет gain, ограниченный `speech_max_gain_db` и
+`speech_true_peak_db`. Если установлен `pyloudnorm`, используется BS.1770/LUFS;
+иначе сервис использует active RMS dBFS.
 
 ## Создать задачу
 
@@ -87,7 +104,9 @@ curl -X POST http://localhost:8088/v1/jobs \
   -F "audio=@call.ogg" \
   -F "reference=@manager_reference.wav" \
   -F "device=cuda:0" \
-  -F "speech_target_dbfs=-22" \
+  -F "speech_loudness_mode=input_matched" \
+  -F "speech_max_gain_db=18" \
+  -F "speech_true_peak_db=-1" \
   -F "speech_intro_duck_sec=2.0" \
   -F "speech_intro_lowpass_sec=5.0" \
   -F "residual_target_dbfs=-43"
@@ -134,6 +153,8 @@ curl http://localhost:8088/v1/jobs/<job_id>/artifacts
 | `noise` | `manager_noise_residual.wav` | фон/шум с подавленным менеджером |
 | `noise_subtract` | `manager_noise_residual_subtract.wav` | контрольный прямой subtract |
 | `raw_speech` | `manager_speech_tse_raw.wav` | сырой вывод WeSep |
+| `aligned_speech` | `manager_speech_tse_aligned.wav` | TSE после delay alignment |
+| `gainmatched_speech` | `manager_speech_tse_gainmatched.wav` | TSE после gain/loudness matching |
 | `original` | `original_aligned.wav` | исходник после выравнивания формата |
 | `report` | `report.json` | полный отчёт с метриками и настройками |
 
@@ -175,9 +196,23 @@ curl -X DELETE http://localhost:8088/v1/jobs/<job_id>
   `speech_intro_lowpass_sec` или поставьте `0`.
 - Если шумовой трек слишком тихий, поднимите `residual_target_dbfs`, например
   с `-45` до `-43`.
+- Если чистый голос всё ещё слишком тихий, сначала оставьте
+  `speech_loudness_mode=input_matched`, но увеличьте `speech_max_gain_db`.
+- Если нужна старая фиксированная громкость, используйте
+  `speech_loudness_mode=fixed` и `speech_target_dbfs=-23`.
 - Если в шумовом треке всё ещё слышен менеджер, лучше сначала улучшить reference.
   Auto-reference удобен для черновой обработки, но отдельный чистый reference
   обычно даёт более стабильное разделение.
+
+## Ограничения текущей версии
+
+Сервис уже не использует fixed `-23 dBFS` как единственный режим и не молчит про
+fallback/DeepFilterNet. Но несколько улучшений оставлены как следующий этап:
+
+- speaker embeddings ECAPA-TDNN для настоящей проверки “это менеджер или нет”;
+- YAMNet/AudioSet для детекции аплодисментов, музыки, лая и фоновой речи;
+- multi-reference прогон `ref_best_10s/ref_best_20s/ref_full` с выбором лучшего;
+- замена proxy spectral scoring на speaker-verification scoring.
 
 ## Где лежат результаты
 

@@ -2,6 +2,7 @@
 soundfile>=0.12
 scipy>=1.11
 librosa>=0.10
+pyloudnorm>=0.1
 
 # Optional model/runtime integrations.
 # For CUDA systems, prefer the official PyTorch install command for your driver.
