@@ -3,7 +3,7 @@
 Сервис оборачивает выбранный пайплайн WeSep в удобный API:
 
 - принимает исходный шумный аудиофайл;
-- принимает чистый reference-голос менеджера или сам выбирает auto-reference;
+- принимает чистый образец голоса менеджера или сам выбирает auto-reference;
 - возвращает чистый голос менеджера;
 - возвращает шумовой/фоновый трек с подавленным голосом менеджера;
 - сохраняет полный `report.json` и служебные артефакты.
@@ -60,7 +60,7 @@ curl http://localhost:8088/v1/defaults
 | параметр | дефолт | смысл |
 |---|---:|---|
 | `models` | `wesep` | использовать только выбранный WeSep-подход |
-| `disable_fallback` | `true` | не подменять WeSep простым DSP fallback |
+| `disable_fallback` | `true` | не подменять WeSep простым резервным DSP-режимом |
 | `device` | `cuda:0` | GPU для инференса |
 | `processing_sample_rate` | `16000` | рабочая частота пайплайна; `0` сохраняет sample rate входа |
 | `tse_chunk_sec` | `25.0` | размер чанка для реального WeSep/TSE |
@@ -102,7 +102,7 @@ curl -X POST http://localhost:8088/v1/jobs \
 ```
 
 В этом режиме сервис сам создаст reference из наиболее активного 20-секундного
-участка. Для production лучше передавать отдельный чистый reference менеджера:
+участка. Для продакшена лучше передавать отдельный чистый reference менеджера:
 
 ```bash
 curl -X POST http://localhost:8088/v1/jobs \
@@ -170,10 +170,10 @@ curl -X POST http://localhost:8088/v1/jobs-dual \
 | параметр | дефолт | смысл |
 |---|---:|---|
 | `dual_cancel_method` | `hybrid` | `simple`, `adaptive_fir`, `spectral_mask`, `hybrid` |
-| `dual_cancel_strength` | `1.0` | сила удаления manager mic из общего микса на первой итерации |
+| `dual_cancel_strength` | `1.0` | сила удаления микрофона менеджера из общего микса на первой итерации |
 | `dual_spectral_strength` | `0.35` | мягкая spectral-mask дочистка клиента |
-| `dual_client_leak_strength` | `0.80` | сила удаления грубого клиента из manager mic |
-| `dual_final_cancel_strength` | `1.0` | финальное удаление очищенного manager mic из общего микса |
+| `dual_client_leak_strength` | `0.80` | сила удаления грубого клиента из микрофона менеджера |
+| `dual_final_cancel_strength` | `1.0` | финальное удаление очищенного микрофона менеджера из общего микса |
 | `dual_max_delay_ms` | `3000.0` | максимум поиска задержки между файлами |
 | `dual_correct_drift` | `false` | включать только для длинных файлов с заметным drift |
 
@@ -183,7 +183,7 @@ curl -X POST http://localhost:8088/v1/jobs-dual \
 |---|---|---|
 | `client` | `client_audio.wav` | клиентская сторона из общего микса |
 | `client_raw` | `client_audio_raw_iter0.wav` | первая грубая оценка клиента |
-| `manager_mic_no_client_leak` | `manager_mic_no_client_leak.wav` | manager mic после удаления утечки клиента |
+| `manager_mic_no_client_leak` | `manager_mic_no_client_leak.wav` | микрофон менеджера после удаления утечки клиента |
 | `manager_side_estimate` | `manager_side_estimate_in_mix.wav` | оценка стороны менеджера в общем миксе |
 | `speech` | `manager_speech_clean.wav` | чистая речь менеджера |
 | `noise` | `manager_noise_residual.wav` | шумы на стороне менеджера |
@@ -293,12 +293,12 @@ curl -X DELETE http://localhost:8088/v1/jobs/<job_id>
   `residual_leak_mask_start_ratio` до `0.12-0.15`.
 - Если нужна старая фиксированная громкость, используйте
   `speech_loudness_mode=fixed` и `speech_target_dbfs=-23`.
-- Если в шумовом треке всё ещё слышен менеджер, лучше сначала улучшить reference.
-  Auto-reference удобен для черновой обработки, но отдельный чистый reference
-  обычно даёт более стабильное разделение.
-- Если есть общий микс и отдельный manager mic, используйте `/v1/jobs-dual`:
-  это качественнее для `client_audio.wav`, потому что manager mic становится
-  полноценным reference-track для cancellation.
+- Если в шумовом треке всё ещё слышен менеджер, лучше сначала улучшить образец
+  голоса. Auto-reference удобен для черновой обработки, но отдельный чистый
+  reference обычно даёт более стабильное разделение.
+- Если есть общий микс и отдельный микрофон менеджера, используйте
+  `/v1/jobs-dual`: это качественнее для `client_audio.wav`, потому что микрофон
+  менеджера становится полноценной опорной дорожкой для cancellation.
 - Для длинных файлов оставляйте `tse_chunk_sec=25` и `tse_overlap_sec=4`.
   На RTX 3060 это дало около `3.8 GB` peak VRAM на файле `1:47:57`. Если нужно
   ещё ниже по VRAM, можно поставить `tse_chunk_sec=15`, но стыков будет больше.
@@ -313,8 +313,9 @@ curl -X DELETE http://localhost:8088/v1/jobs/<job_id>
 
 ## Ограничения текущей версии
 
-Сервис уже не использует fixed `-23 dBFS` как единственный режим и не молчит про
-fallback/DeepFilterNet. Но несколько улучшений оставлены как следующий этап:
+Сервис уже не использует fixed `-23 dBFS` как единственный режим и явно пишет в
+отчёт, когда вместо модели используется резервная обработка или отсутствует
+DeepFilterNet. Но несколько улучшений оставлены как следующий этап:
 
 - speaker embeddings ECAPA-TDNN для настоящей проверки “это менеджер или нет”;
 - YAMNet/AudioSet для детекции аплодисментов, музыки, лая и фоновой речи;

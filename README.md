@@ -1,27 +1,30 @@
 # audio_manager_separation
 
-Offline pipeline for separating a manager's voice from background audio using a
-target-speaker-first design:
+Офлайн-пайплайн и HTTP-сервис для отделения голоса менеджера от фонового аудио.
+Основная идея: сначала получить целевую речь менеджера через TSE
+(`target speaker extraction`), затем построить остаточный шумовой трек и
+дочистить обе дорожки спектральными фильтрами.
 
 ```text
 input/manager_mic_mono.wav + input/manager_reference_clean.wav
-        -> TSE raw speech
-        -> sample-aligned residual subtraction
-        -> optional speech enhancement
+        -> сырой TSE-голос менеджера
+        -> delay alignment и loudness matching
+        -> residual/subtract и spectral masks
+        -> чистый голос менеджера + шумовой остаток
 ```
 
-Primary outputs:
+Главные выходные файлы:
 
-- `output/manager_speech_tse_raw.wav`
-- `output/manager_speech_clean_prefilter.wav`
-- `output/manager_speech_clean.wav`
-- `output/manager_noise_residual_prefilter.wav`
-- `output/manager_noise_residual.wav`
-- `output/report.json`
+- `output/manager_speech_clean.wav` - финальный чистый голос менеджера;
+- `output/manager_noise_residual.wav` - фон/шум с подавленным менеджером;
+- `output/manager_speech_tse_raw.wav` - сырой вывод WeSep/TSE;
+- `output/manager_speech_clean_prefilter.wav` - речь до финального residual-фильтра;
+- `output/manager_noise_residual_prefilter.wav` - шум до финального подавления следов менеджера;
+- `output/report.json` - полный отчёт с настройками, метриками и предупреждениями.
 
-## Install
+## Установка
 
-Core smoke tests need only Python and NumPy:
+Минимальный smoke-тест требует только Python и базовые зависимости:
 
 ```bash
 python3 -m venv .venv
@@ -29,27 +32,27 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-For RTX 3090/CUDA, install PyTorch with the CUDA wheel recommended by PyTorch
-for your driver, then install the target model repositories you want to test.
-Optional Python packages used by richer audio/model integrations are listed in
+Для GPU-инференса установите PyTorch с CUDA wheel, подходящим под драйвер
+сервера, затем установите WeSep и дополнительные модели. Необязательные
+пакеты для расширенных аудио/model-интеграций перечислены в
 `requirements-optional.txt`.
 
-Conda option:
+Вариант через Conda:
 
 ```bash
 conda env create -f environment.yml
 conda activate audio-manager-separation
 ```
 
-## Smoke Test
+## Быстрый smoke-тест
 
-Generate synthetic input/reference audio:
+Сгенерировать синтетический вход и reference:
 
 ```bash
 python benchmark.py --make-smoke-inputs --outdir input --sample-rate 16000 --duration 12
 ```
 
-Run the pipeline:
+Запустить пайплайн:
 
 ```bash
 python process_call.py \
@@ -63,21 +66,21 @@ python process_call.py \
   --tse-overlap-sec 4
 ```
 
-Without configured WeSep commands, the pipeline uses the
-built-in DSP fallback so the file flow, alignment, residual generation, and JSON
-report can be tested. The fallback is intentionally marked low confidence and is
-not a production TSE model.
+Если реальные TSE-команды не настроены, пайплайн может использовать встроенный
+резервный DSP-режим (`fallback`). Он нужен только для проверки файлового потока,
+alignment, residual-генерации и `report.json`; для продакшена это не замена
+WeSep.
 
-## Run One Real File
+## Запуск на одном реальном файле
 
-Place files here:
+Положите файлы:
 
 ```text
 input/manager_mic_mono.wav
 input/manager_reference_clean.wav
 ```
 
-Then run:
+Запустите:
 
 ```bash
 python process_call.py \
@@ -85,57 +88,75 @@ python process_call.py \
   --reference input/manager_reference_clean.wav \
   --outdir output \
   --device cuda:0 \
-  --quality max
+  --quality max \
+  --models wesep \
+  --disable-fallback \
+  --processing-sample-rate 16000 \
+  --tse-chunk-sec 25 \
+  --tse-overlap-sec 4
 ```
 
-## Configure Real TSE Models
+`--processing-sample-rate 16000` уменьшает потребление памяти и размер WAV для
+длинных звонков. Если нужно сохранить исходную частоту дискретизации, передайте
+`--processing-sample-rate 0`, но для длинных файлов это заметно тяжелее.
 
-The adapters use command templates. Copy and source the checked-in template from
-the project root:
+## Настройка реального WeSep/TSE
+
+Адаптеры вызывают внешние модели через command templates. Скопируйте шаблон:
 
 ```bash
 cp env.tse.example env.tse
 source env.tse
 ```
 
-The template wires the selected WeSep wrapper:
+Основная команда WeSep:
 
 ```bash
 export WESEP_TSE_CMD='python scripts/run_wesep_tse.py --mixture {mixture} --reference {reference} --output {output} --sample-rate {sample_rate} --device {device}'
 ```
 
-Supported template placeholders:
+Доступные placeholders:
 
-- `{mixture}`
-- `{reference}`
-- `{output}`
-- `{sample_rate}`
-- `{device}`
+- `{mixture}` - подготовленный входной микс;
+- `{reference}` - reference-голос менеджера;
+- `{output}` - путь для результата модели;
+- `{sample_rate}` - рабочая частота дискретизации;
+- `{device}` - `cuda:0`, `cuda:1` или `cpu`.
 
-## HTTP Service
+Подробности установки моделей: [docs/model_setup.md](docs/model_setup.md).
 
-Run the API service:
+## HTTP-сервис
+
+Запустить API:
 
 ```bash
 python service.py --host 0.0.0.0 --port 8088
 ```
 
-Main endpoints:
+Основные ручки:
 
-- `POST /v1/jobs` - upload audio and optional manager reference.
-- `POST /v1/jobs-dual` - upload call mix + separate manager mic + optional manager reference.
-- `GET /v1/jobs/{job_id}` - check status.
-- `GET /v1/jobs/{job_id}/artifacts/client` - download `client_audio.wav` for dual jobs.
-- `GET /v1/jobs/{job_id}/artifacts/speech` - download `manager_speech_clean.wav`.
-- `GET /v1/jobs/{job_id}/artifacts/noise` - download `manager_noise_residual.wav`.
-- `GET /v1/jobs/{job_id}/artifacts.zip` - build and download all artifacts on demand.
+- `GET /health` - состояние сервиса и наличие WeSep/DeepFilterNet;
+- `GET /v1/defaults` - текущие настройки по умолчанию;
+- `POST /v1/jobs` - загрузить аудио и опциональный reference менеджера;
+- `POST /v1/jobs-dual` - загрузить общий микс и отдельный микрофон менеджера;
+- `GET /v1/jobs/{job_id}` - статус и прогресс задачи;
+- `GET /v1/jobs/{job_id}/artifacts` - список доступных артефактов;
+- `GET /v1/jobs/{job_id}/artifacts/speech` - скачать `manager_speech_clean.wav`;
+- `GET /v1/jobs/{job_id}/artifacts/noise` - скачать `manager_noise_residual.wav`;
+- `GET /v1/jobs/{job_id}/artifacts.zip` - собрать и скачать архив всех артефактов.
 
-Russian API documentation: `docs/service_api_ru.md`.
+Полная документация API: [docs/service_api_ru.md](docs/service_api_ru.md).
 
-## Dual Input Mode
+## Dual-input режим
 
-Use this mode when you have both a common call mix and a separate manager
-microphone track:
+Используйте этот режим, если есть два файла:
+
+```text
+call_mix.wav      - общий микс: клиент + менеджер + фон
+manager_mic.wav   - отдельный микрофон менеджера
+```
+
+Запуск из CLI:
 
 ```bash
 python process_dual_input.py \
@@ -149,14 +170,15 @@ python process_dual_input.py \
   --disable-fallback
 ```
 
-The dual pipeline writes `client_audio.wav`, `manager_speech_clean.wav`, and
-`manager_noise_residual.wav`. It first uses the manager mic as a reference to
-cancel the manager side from the call mix, then removes the rough client track
-from the manager mic before running the existing target-speaker pipeline.
+Dual-input сначала выравнивает общий микс и микрофон менеджера, затем использует
+эту дорожку как опорный сигнал для удаления менеджера из общего микса. После
+этого грубая оценка клиента удаляется из микрофона менеджера, и уже очищенный
+сигнал отправляется в тот же TSE-пайплайн. На выходе появляются
+`client_audio.wav`, `manager_speech_clean.wav` и `manager_noise_residual.wav`.
 
-## Long Files
+## Длинные файлы
 
-Real WeSep inference is chunked by default:
+Для длинных записей WeSep работает чанками по умолчанию:
 
 ```text
 processing_sample_rate=16000
@@ -164,33 +186,47 @@ tse_chunk_sec=25
 tse_overlap_sec=4
 ```
 
-The service decodes/resamples speech work to 16 kHz, then the wrapper loads
-WeSep once, processes each chunk with the same manager reference, and stitches
-the output with overlap-add. This keeps VRAM bounded for long recordings, while
-16 kHz processing keeps the resulting WAV artifacts smaller than full-rate
-48 kHz output. The API exposes live chunk progress through
-`GET /v1/jobs/{job_id}`. On the 1:47:57 `long_test.mp3` benchmark,
-25-second chunks on RTX 3060 used about 3.8 GB VRAM, processed the TSE stage at
-about 23x realtime, and completed the full service pipeline in about
-702 seconds.
+Wrapper загружает WeSep один раз, обрабатывает каждый чанк с тем же reference
+менеджера и склеивает результат через overlap-add. Это удерживает VRAM в рамках
+выбранного размера чанка. Рабочая частота `16 kHz` уменьшает размер итоговых WAV
+и память CPU-постфильтров.
 
-## Benchmark
+Прогресс виден через `GET /v1/jobs/{job_id}`. Во время WeSep-инференса сервис
+возвращает `stage=wesep_extract`, `chunk_current`, `chunk_total` и процент
+готовности.
 
-Create synthetic mixtures:
+Проверенный benchmark на `long_test.mp3`:
+
+```text
+длительность: 1:47:57 / 6477 sec
+GPU: RTX 3060
+tse_chunk_sec: 25
+tse_overlap_sec: 4
+peak VRAM WeSep: ~3.8 GB
+скорость WeSep stage: ~23x realtime
+полный сервисный пайплайн: ~702 sec / ~9.2x realtime
+```
+
+Если нужно снизить VRAM ещё сильнее, поставьте `tse_chunk_sec=15`; качество
+стыков обычно остаётся нормальным, но чанков становится больше.
+
+## Бенчмарк
+
+Сгенерировать синтетические смеси:
 
 ```bash
 python benchmark.py --generate --benchmark-dir benchmark --count 200 --duration 8
 ```
 
-This creates:
+Будут созданы:
 
-- `benchmark/generated_mixes/*/mixture.wav`
-- `benchmark/generated_mixes/*/clean_target.wav`
-- `benchmark/generated_mixes/*/true_noise.wav`
-- `benchmark/results.csv`
-- `benchmark/summary.md`
+- `benchmark/generated_mixes/*/mixture.wav`;
+- `benchmark/generated_mixes/*/clean_target.wav`;
+- `benchmark/generated_mixes/*/true_noise.wav`;
+- `benchmark/results.csv`;
+- `benchmark/summary.md`.
 
-Evaluate a processed clip:
+Оценить обработанный фрагмент:
 
 ```bash
 python evaluate.py \
@@ -201,9 +237,12 @@ python evaluate.py \
   --clean-target benchmark/generated_mixes/clip_0000_snr_-10db/clean_target.wav
 ```
 
-## Output Contract
+Для ручной оценки качества используйте протокол:
+[docs/listening_protocol.md](docs/listening_protocol.md).
 
-Every run writes:
+## Контракт выходных файлов
+
+Каждый single-input запуск пишет:
 
 ```text
 output/original_aligned.wav
@@ -221,7 +260,7 @@ output/candidates/*.wav
 output/references/*.wav
 ```
 
-Dual-input runs additionally write:
+Dual-input дополнительно пишет:
 
 ```text
 output/client_audio.wav
@@ -232,32 +271,34 @@ output/client_leak_estimate_in_manager_mic.wav
 output/dual_prepare_report.json
 ```
 
-`manager_speech_tse_aligned.wav` is the selected TSE output after delay
-alignment. `manager_speech_tse_gainmatched.wav` is aligned and loudness-matched
-to active speech-like regions in the input. `manager_speech_clean.wav` is the
-post-enhanced speech before the final residual-guided denoise pass.
-`manager_speech_clean.wav` is the final listening speech; by default it uses
-`input_matched` active loudness rather than a fixed -23 dBFS target, applies a
-true-peak style sample peak limiter, and removes residual/background-like bins.
-`manager_noise_residual_subtract.wav` is the conservative direct-subtraction
-residual. `manager_noise_residual_prefilter.wav` is the residual after the base
-manager suppression pass. `manager_noise_residual.wav` is the final listening
-residual: it uses `manager_speech_clean.wav` as a spectral guide, adds an extra
-manager-leak suppression pass, and is gently lifted toward -45 dBFS for easier
-listening.
+Ключевые стадии:
 
-## Known Limitations
+- `manager_speech_tse_aligned.wav` - выбранный TSE после delay alignment;
+- `manager_speech_tse_gainmatched.wav` - TSE после выравнивания громкости по активным участкам входа;
+- `manager_speech_clean_prefilter.wav` - речь после speech enhancement, но до финального residual-guided фильтра;
+- `manager_speech_clean.wav` - финальная дорожка речи для прослушивания;
+- `manager_noise_residual_subtract.wav` - контрольный прямой subtract;
+- `manager_noise_residual_prefilter.wav` - residual после базового подавления менеджера;
+- `manager_noise_residual.wav` - финальный шумовой трек для прослушивания.
 
-- Real production quality depends on installing and validating the selected
-  WeSep runtime on representative calls.
-- In `quality=max`, DSP fallback is disabled unless `--allow-fallback` is passed.
-- If DeepFilterNet is unavailable, the report now records
-  `deepfilternet_unavailable_builtin_postprocess_used`; pass
-  `--require-deepfilternet` to fail instead.
-- Built-in scoring metrics are proxies. Add SpeechBrain embeddings, DNSMOS/NISQA,
-  and ASR confidence before making production decisions.
-- Direct residual subtraction is only physically meaningful when the selected TSE
-  output is sample-aligned and phase-compatible with the input. The final
-  listening residual therefore uses manager suppression rather than only direct
-  subtraction.
-- MP3/M4A/FLAC support depends on installing optional audio I/O dependencies.
+По умолчанию речь использует `input_matched` loudness вместо фиксированных
+`-23 dBFS`: сервис измеряет активные участки входа и применяет ограниченный
+gain к извлечённой речи. Финальный шумовой трек дополнительно использует
+`manager_speech_clean.wav` как spectral guide, подавляет следы менеджера и
+поднимается примерно к `-45 dBFS`, чтобы его было удобно слушать.
+
+## Ограничения
+
+- Production-качество зависит от корректной установки и проверки WeSep на
+  реальных звонках.
+- В `quality=max` резервный DSP-режим отключён, если явно не передать
+  `--allow-fallback`.
+- Если DeepFilterNet недоступен, `report.json` получает warning
+  `deepfilternet_unavailable_builtin_postprocess_used`; `--require-deepfilternet`
+  заставляет пайплайн падать без реального DeepFilterNet.
+- Встроенные метрики качества пока приближённые. Для продакшен-решений стоит
+  добавить speaker embeddings, DNSMOS/NISQA и ASR confidence.
+- Прямой residual subtraction физически корректен только когда TSE-выход
+  sample-aligned и phase-compatible с входом. Поэтому финальный residual для
+  прослушивания использует spectral manager suppression, а не только subtract.
+- Поддержка MP3/M4A/FLAC зависит от установленных optional audio I/O зависимостей.

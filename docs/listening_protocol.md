@@ -1,21 +1,32 @@
-# Real-World Listening Protocol
+# Протокол ручного прослушивания
 
-Create 20-50 short fragments from real calls and score each output manually.
+Чтобы выбрать стабильные настройки, сделайте 20-50 коротких фрагментов из
+реальных звонков и оцените каждый выход вручную. Лучше брать разные ситуации:
+тихая речь, громкая речь, музыка/аплодисменты, фоновые голоса, шум комнаты,
+перебивания и участки без речи менеджера.
 
-Suggested columns:
+Рекомендуемые колонки таблицы:
 
-- file
-- fragment_start_sec
-- fragment_end_sec
-- manager_speech_clarity: 1-5
-- background_left_in_speech: 1-5
-- manager_leakage_in_residual: 1-5
-- residual_preserves_background: 1-5
-- neural_artifacts: 1-5
-- confidence: high/medium/low
-- notes
+- `file` - исходный файл;
+- `fragment_start_sec` - начало фрагмента;
+- `fragment_end_sec` - конец фрагмента;
+- `manager_speech_clarity` - разборчивость менеджера, `1-5`;
+- `background_left_in_speech` - сколько фона осталось в чистой речи, `1-5`;
+- `manager_leakage_in_residual` - насколько менеджер слышен в шумовом треке, `1-5`;
+- `residual_preserves_background` - насколько шумовой трек сохранил фон, `1-5`;
+- `neural_artifacts` - водянистость/металличность/роботизация, `1-5`;
+- `confidence` - уверенность оценки: `high`, `medium`, `low`;
+- `notes` - свободный комментарий.
 
-Use `manager_speech_tse_raw.wav` to judge separation and
-`manager_speech_clean.wav` to judge perceptual quality. Judge
-`manager_noise_residual.wav` separately: it is supposed to preserve TV, dog
-barks, music, background voices, and room noise.
+Как слушать:
+
+- `manager_speech_tse_raw.wav` показывает качество самого TSE-разделения.
+- `manager_speech_clean.wav` оценивайте как финальный голос менеджера для
+  продукта.
+- `manager_noise_residual.wav` слушайте отдельно: он должен сохранять фон,
+  музыку, аплодисменты, чужую речь и комнатный шум, но по возможности подавлять
+  менеджера.
+
+Практическое правило: если сырой TSE уже отделил не того человека, постфильтры
+это не исправят. В таком случае улучшайте образец голоса менеджера или
+переходите на dual-input режим с отдельным `manager_mic.wav`.

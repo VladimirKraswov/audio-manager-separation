@@ -1,93 +1,126 @@
-# Model Setup Notes
+# Настройка моделей
 
-The repository ships with command-template adapters so the pipeline can call
-real TSE/enhancement systems without baking one research repo into this project.
-Copy `env.tse.example` to `env.tse`, then source it from the project root before
-running `process_call.py`.
+Репозиторий использует адаптеры шаблонных команд: основной пайплайн умеет
+вызывать реальные TSE-системы и модели улучшения речи, но не вшивает
+исследовательские репозитории внутрь проекта. Это позволяет отдельно обновлять WeSep,
+DeepFilterNet и другие модели.
+
+Перед запуском скопируйте шаблон окружения:
 
 ```bash
 cp env.tse.example env.tse
 source env.tse
 ```
 
-The selected project wrapper is WeSep:
+Текущая TSE-обёртка - WeSep:
 
 ```bash
 export WESEP_TSE_CMD='python scripts/run_wesep_tse.py --mixture {mixture} --reference {reference} --output {output} --sample-rate {sample_rate} --device {device}'
 ```
 
+## Подстановки
+
+В каждой шаблонной команде доступны:
+
+- `{mixture}` - подготовленный входной микс;
+- `{reference}` - образец голоса целевого спикера;
+- `{output}` - путь, куда модель должна записать результат;
+- `{sample_rate}` - рабочая частота дискретизации;
+- `{device}` - устройство инференса, например `cuda:0`, `cuda:1` или `cpu`.
+
 ## WeSep
 
-Install WeSep from its official repository under `external/wesep`, install the
-package in the main `.venv`, and install WeSpeaker because the pretrained WeSep
-model depends on its speaker encoder definitions.
+Установите WeSep из официального репозитория в `external/wesep`, подключите его
+к основной `.venv` и установите WeSpeaker, потому что pretrained WeSep-модель
+зависит от определений speaker encoder из WeSpeaker.
 
-The placeholders available to every command template are:
-
-- `{mixture}`
-- `{reference}`
-- `{output}`
-- `{sample_rate}`
-- `{device}`
-
-`scripts/run_wesep_tse.py` processes long files in chunks by default:
+`scripts/run_wesep_tse.py` обрабатывает длинные файлы чанками:
 
 ```bash
 --chunk-sec 25 --overlap-sec 4
 ```
 
-The model is loaded once, each chunk is extracted with the same reference, and
-the result is stitched with overlap-add. This is required for long recordings:
-passing a 15-minute or longer file to WeSep as one tensor risks OOM, while
-chunking keeps VRAM close to the selected chunk size.
+Модель загружается один раз, каждый чанк извлекается с тем же образцом голоса, а
+результат склеивается через overlap-add. Для длинных записей это обязательно:
+если подать в WeSep 15 минут или больше одним тензором, легко получить OOM.
+Чанки держат VRAM примерно пропорционально выбранному `chunk_sec`.
 
-## Residual Noise Track
+Рекомендации:
 
-The selected speech chain now keeps the intermediate stages:
+- `25 sec / 4 sec overlap` - текущий баланс качества, скорости и VRAM;
+- `15 sec / 3 sec overlap` - режим для меньшей VRAM;
+- `35-45 sec` - можно пробовать на больших GPU, но выигрыш по скорости небольшой.
 
-- `manager_speech_tse_raw.wav` - direct selected TSE output.
-- `manager_speech_tse_aligned.wav` - delay-aligned TSE output.
-- `manager_speech_tse_gainmatched.wav` - aligned and loudness-matched to active
-  input speech-like regions.
-- `manager_speech_clean_prefilter.wav` - post-enhanced speech before the final
-  residual-guided denoise pass.
-- `manager_speech_clean.wav` - final post-enhanced listening speech.
+## Шумовой residual-трек
 
-By default speech loudness uses `input_matched`, not a fixed -23 dBFS target.
-When `pyloudnorm` is installed, active loudness uses BS.1770/LUFS; otherwise the
-pipeline falls back to active RMS dBFS. The final speech file applies an extra
-residual-guided mask to reduce background that leaked through TSE. The final
-residual noise track, `manager_noise_residual.wav`, is built by strongly
-suppressing bins that look like the cleaned manager voice, then applies an extra
-manager-leak suppression pass and is lifted toward -45 dBFS. The prefilter
-residual is saved as `manager_noise_residual_prefilter.wav`; the direct
-subtraction audit file is preserved as `manager_noise_residual_subtract.wav`.
+Пайплайн сохраняет промежуточные стадии:
 
-In `quality=max`, DSP fallback is disabled unless `--allow-fallback` is passed.
-If DeepFilterNet is not installed, the pipeline records a warning and uses the
-built-in postprocess; pass `--require-deepfilternet` to fail instead.
+- `manager_speech_tse_raw.wav` - прямой вывод выбранной TSE-модели;
+- `manager_speech_tse_aligned.wav` - TSE после delay alignment;
+- `manager_speech_tse_gainmatched.wav` - TSE после loudness/gain matching;
+- `manager_speech_clean_prefilter.wav` - речь до финального residual-guided denoise;
+- `manager_speech_clean.wav` - финальная речь менеджера;
+- `manager_noise_residual_subtract.wav` - контрольный прямой subtract;
+- `manager_noise_residual_prefilter.wav` - residual после базового подавления менеджера;
+- `manager_noise_residual.wav` - финальный шумовой трек.
 
-## Dual Input Mode
+По умолчанию громкость речи работает в режиме `input_matched`, а не фиксируется
+в `-23 dBFS`. Если установлен `pyloudnorm`, активная громкость считается через
+BS.1770/LUFS; иначе используется active RMS dBFS. Финальная речь дополнительно
+проходит residual-guided маску, чтобы убрать фон, который просочился через TSE.
 
-When a common call mix and a separate manager mic are available, run
-`process_dual_input.py`. This mode first aligns both recordings, uses the
-manager mic as a reference to cancel the manager side from the call mix, removes
-the rough client estimate from the manager mic, and only then runs the same TSE
-chain described above. The TSE model setup does not change; dual-input simply
-feeds it a cleaner `manager_mic_no_client_leak.wav`.
-
-## Smoke Tests
-
-```bash
-python process_call.py --input input/manager_mic_mono.wav --reference input/manager_reference_clean.wav --outdir output_wesep_test --device cuda:0 --quality smoke --models wesep --disable-fallback --chunk-sec 6 --overlap-sec 1
-```
+Финальный шумовой трек строится не только прямым subtract. Он подавляет
+частотно-временные bins, похожие на очищенный голос менеджера, затем проходит
+дополнительный manager-leak suppression и нормализуется примерно к `-45 dBFS`.
 
 ## DeepFilterNet
 
-If `deepFilter` is on `PATH`, `process_call.py` will try to use it. Otherwise it
-falls back to a mild high-pass/limiter pass so the smoke test remains runnable.
-You can also provide a custom command:
+Если `deepFilter` доступен в `PATH`, `process_call.py` попробует использовать
+его для улучшения речи. Если DeepFilterNet не установлен, пайплайн пишет warning
+в `report.json` и использует мягкую встроенную постобработку, чтобы smoke-тесты
+оставались рабочими.
+
+Можно задать свою команду:
 
 ```bash
 export DEEPFILTERNET_CMD='deepFilter {input} --output {output}'
+```
+
+Если нужен строгий режим без резервной обработки, передайте:
+
+```bash
+--require-deepfilternet
+```
+
+## Dual-input режим
+
+Если есть общий микс и отдельная запись микрофона менеджера, запускайте
+`process_dual_input.py` или ручку `/v1/jobs-dual`. Режим сначала выравнивает обе
+записи, использует микрофон менеджера как опорную дорожку для удаления
+менеджера из общего микса, затем удаляет грубую оценку клиента из микрофона
+менеджера. После этого очищенный `manager_mic_no_client_leak.wav` отправляется
+в обычную TSE-цепочку.
+
+Настройка WeSep при этом не меняется: dual-input просто даёт TSE более чистый
+вход.
+
+## Smoke-тест WeSep
+
+```bash
+python process_call.py \
+  --input input/manager_mic_mono.wav \
+  --reference input/manager_reference_clean.wav \
+  --outdir output_wesep_test \
+  --device cuda:0 \
+  --quality smoke \
+  --models wesep \
+  --disable-fallback \
+  --chunk-sec 6 \
+  --overlap-sec 1
+```
+
+Для длинных файлов используйте продакшен-настройки:
+
+```bash
+--processing-sample-rate 16000 --tse-chunk-sec 25 --tse-overlap-sec 4
 ```
