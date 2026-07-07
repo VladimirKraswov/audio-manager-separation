@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, Iterator, List, Tuple
 
 import numpy as np
 
@@ -73,6 +75,8 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     started = time.time()
+    progress_path = Path(args.progress_file) if args.progress_file else None
+    write_progress(progress_path, stage="starting", progress=0.0, message="Starting processing")
 
     outdir = Path(args.outdir)
     candidates_dir = outdir / "candidates"
@@ -82,7 +86,9 @@ def main() -> int:
         directory.mkdir(parents=True, exist_ok=True)
 
     warnings: List[str] = []
-    original, original_sr = read_audio(args.input, mono=True)
+    target_sr = int(args.processing_sample_rate) if args.processing_sample_rate and args.processing_sample_rate > 0 else None
+    original, original_sr = read_audio(args.input, target_sr=target_sr, mono=True)
+    write_progress(progress_path, stage="preprocess", progress=0.03, message="Loaded input audio")
     original_aligned, original_info = preprocess_audio(
         original,
         original_sr,
@@ -95,6 +101,7 @@ def main() -> int:
     reference, _ = read_audio(args.reference, target_sr=original_sr, mono=True)
     reference_info = prepare_reference(reference, original_sr, refs_dir)
     warnings.extend(reference_info.get("warnings", []))
+    write_progress(progress_path, stage="reference", progress=0.08, message="Prepared manager reference")
 
     disable_fallback = args.disable_fallback or (args.quality == "max" and not args.allow_fallback)
     model_names = [name.strip().lower() for name in args.models.split(",") if name.strip()]
@@ -125,6 +132,9 @@ def main() -> int:
                 args.device,
                 args.chunk_sec,
                 args.overlap_sec,
+                args.tse_chunk_sec,
+                args.tse_overlap_sec,
+                progress_path,
             )
             candidate_paths[model_name] = path
             speech, _ = read_audio(path, target_sr=original_sr, mono=True)
@@ -133,6 +143,13 @@ def main() -> int:
             score = candidate_score(original_aligned, speech, residual, reference, original_sr)
             score["alignment"] = residual_meta
             candidate_scores[model_name] = score
+            write_progress(
+                progress_path,
+                stage="candidate_scoring",
+                progress=0.70,
+                message=f"Scored TSE candidate {model_name}",
+                details={"candidate_scores": candidate_scores},
+            )
         except ModelUnavailableError as exc:
             candidate_failures[model_name] = str(exc)
         except Exception as exc:  # keep trying other candidates
@@ -142,6 +159,13 @@ def main() -> int:
         raise RuntimeError(f"No TSE candidates succeeded. Failures: {candidate_failures}")
 
     selected_model = max(candidate_scores, key=lambda name: candidate_scores[name]["overall"])
+    write_progress(
+        progress_path,
+        stage="postprocess",
+        progress=0.72,
+        message=f"Selected TSE model {selected_model}",
+        details={"selected_tse_model": selected_model},
+    )
     selected_speech, _ = read_audio(candidate_paths[selected_model], target_sr=original_sr, mono=True)
     selected_speech = match_length(selected_speech, len(original_aligned))
     write_wav(outdir / "manager_speech_tse_raw.wav", selected_speech, original_sr, subtype="FLOAT", prevent_clip=False)
@@ -234,6 +258,7 @@ def main() -> int:
         true_peak_db=args.speech_true_peak_db,
     )
     write_wav(outdir / "manager_speech_clean.wav", speech_clean, original_sr, subtype="PCM_16")
+    write_progress(progress_path, stage="speech_done", progress=0.86, message="Finished manager speech")
 
     final_residual, suppression_meta = make_manager_suppressed_residual(
         original_aligned,
@@ -267,6 +292,7 @@ def main() -> int:
     )
     final_residual = peak_limit(final_residual, ceiling=0.85)
     write_wav(outdir / "manager_noise_residual.wav", final_residual, original_sr, subtype="PCM_16")
+    write_progress(progress_path, stage="residual_done", progress=0.95, message="Finished manager noise residual")
 
     if selected_model == "fallback":
         warnings.append(
@@ -336,6 +362,13 @@ def main() -> int:
         "runtime_sec": time.time() - started,
     }
     write_json(outdir / "report.json", report)
+    write_progress(
+        progress_path,
+        stage="done",
+        progress=1.0,
+        message="Processing finished",
+        details={"outdir": str(outdir), "selected_tse_model": selected_model, "runtime_sec": time.time() - started},
+    )
     print(json.dumps({"outdir": str(outdir), "selected_tse_model": selected_model, "warnings": warnings}, indent=2))
     return 0
 
@@ -347,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--outdir", default="output", help="Output directory")
     parser.add_argument("--device", default="cuda:0", help="Model device, e.g. cuda:0 or cpu")
     parser.add_argument("--quality", default="max", choices=["smoke", "fast", "max"])
+    parser.add_argument("--processing-sample-rate", type=int, default=16000, help="Decode/resample input before processing; use 0 to preserve input rate")
     parser.add_argument(
         "--models",
         default="wesep,fallback",
@@ -356,6 +390,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-fallback", action="store_true", help="Allow DSP fallback even when --quality=max")
     parser.add_argument("--chunk-sec", type=float, default=25.0)
     parser.add_argument("--overlap-sec", type=float, default=4.0)
+    parser.add_argument("--tse-chunk-sec", type=float, default=25.0)
+    parser.add_argument("--tse-overlap-sec", type=float, default=4.0)
+    parser.add_argument("--progress-file", default="")
     parser.add_argument("--highpass-hz", type=float, default=None)
     parser.add_argument("--speech-loudness-mode", default="input_matched", choices=["input_matched", "fixed"])
     parser.add_argument("--speech-target-dbfs", type=float, default=-23.0)
@@ -389,6 +426,9 @@ def run_tse_candidate(
     device: str,
     chunk_sec: float,
     overlap_sec: float,
+    tse_chunk_sec: float,
+    tse_overlap_sec: float,
+    progress_file: Path | None,
 ) -> Path:
     output_path = candidates_dir / config["filename"]
     model_sr = config["sample_rate"] or original_sr
@@ -411,7 +451,16 @@ def run_tse_candidate(
     raw_model_output = prepared_dir / f"{model_name}_raw_{model_sr}.wav"
     write_wav(mixture_path, mixture_model, model_sr, subtype="PCM_16")
     write_wav(reference_path, reference_model, model_sr, subtype="PCM_16")
-    runner(mixture_path, reference_path, raw_model_output, model_sr, device)
+    env_updates = {}
+    if model_name == "wesep":
+        env_updates = {
+            "WESEP_CHUNK_SEC": str(tse_chunk_sec),
+            "WESEP_OVERLAP_SEC": str(tse_overlap_sec),
+        }
+        if progress_file:
+            env_updates["WESEP_PROGRESS_FILE"] = str(progress_file)
+    with temporary_env(env_updates):
+        runner(mixture_path, reference_path, raw_model_output, model_sr, device)
     model_audio, model_output_sr = read_audio(raw_model_output, mono=True)
     candidate = resample_audio(model_audio, model_output_sr, original_sr)
     candidate = match_length(candidate, len(original))
@@ -433,6 +482,39 @@ def write_json(path: Path, data: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def write_progress(progress_path: Path | None, *, stage: str, progress: float, message: str, details: Dict | None = None) -> None:
+    if not progress_path:
+        return
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "stage": stage,
+        "progress": float(np.clip(progress, 0.0, 1.0)),
+        "message": message,
+        "details": details or {},
+        "updated_at": time.time(),
+    }
+    temp_path = progress_path.with_suffix(progress_path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temp_path.replace(progress_path)
+
+
+@contextmanager
+def temporary_env(values: Dict[str, str]) -> Iterator[None]:
+    if not values:
+        yield
+        return
+    old_values = {key: os.environ.get(key) for key in values}
+    try:
+        os.environ.update(values)
+        yield
+    finally:
+        for key, old in old_values.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
 
 
 if __name__ == "__main__":

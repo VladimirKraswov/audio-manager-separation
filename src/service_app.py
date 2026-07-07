@@ -62,6 +62,7 @@ class JobSummary(BaseModel):
     settings: Dict[str, Any]
     selected_tse_model: Optional[str] = None
     error: Optional[str] = None
+    progress: Optional[Dict[str, Any]] = None
 
 
 class JobCreated(BaseModel):
@@ -77,8 +78,11 @@ class Defaults(BaseModel):
     quality: str = "max"
     models: str = "wesep"
     disable_fallback: bool = True
+    processing_sample_rate: int = 16000
     chunk_sec: float = 25.0
     overlap_sec: float = 4.0
+    tse_chunk_sec: float = 25.0
+    tse_overlap_sec: float = 4.0
     speech_loudness_mode: str = "input_matched"
     speech_target_dbfs: float = -23.0
     speech_max_gain_db: float = 18.0
@@ -158,8 +162,11 @@ async def create_job(
     quality: str = Form("max"),
     models: str = Form("wesep"),
     disable_fallback: bool = Form(True),
+    processing_sample_rate: int = Form(16000),
     chunk_sec: float = Form(25.0),
     overlap_sec: float = Form(4.0),
+    tse_chunk_sec: float = Form(25.0),
+    tse_overlap_sec: float = Form(4.0),
     highpass_hz: Optional[float] = Form(None),
     speech_loudness_mode: str = Form("input_matched"),
     speech_target_dbfs: float = Form(-23.0),
@@ -206,8 +213,11 @@ async def create_job(
         "quality": quality,
         "models": models,
         "disable_fallback": disable_fallback,
+        "processing_sample_rate": processing_sample_rate,
         "chunk_sec": chunk_sec,
         "overlap_sec": overlap_sec,
+        "tse_chunk_sec": tse_chunk_sec,
+        "tse_overlap_sec": tse_overlap_sec,
         "highpass_hz": highpass_hz,
         "speech_loudness_mode": speech_loudness_mode,
         "speech_target_dbfs": speech_target_dbfs,
@@ -237,6 +247,7 @@ async def create_job(
         "updated_at": _now(),
         "input_file": str(audio_path),
         "reference_file": str(reference_path) if reference_path else None,
+        "progress_file": str(job_dir / "progress.json"),
         "settings": settings,
     }
     _write_state(job_dir, state)
@@ -259,8 +270,11 @@ async def create_dual_job(
     quality: str = Form("max"),
     models: str = Form("wesep"),
     disable_fallback: bool = Form(True),
+    processing_sample_rate: int = Form(16000),
     chunk_sec: float = Form(25.0),
     overlap_sec: float = Form(4.0),
+    tse_chunk_sec: float = Form(25.0),
+    tse_overlap_sec: float = Form(4.0),
     highpass_hz: Optional[float] = Form(None),
     dual_cancel_method: str = Form("hybrid"),
     dual_cancel_strength: float = Form(1.0),
@@ -322,8 +336,11 @@ async def create_dual_job(
         "quality": quality,
         "models": models,
         "disable_fallback": disable_fallback,
+        "processing_sample_rate": processing_sample_rate,
         "chunk_sec": chunk_sec,
         "overlap_sec": overlap_sec,
+        "tse_chunk_sec": tse_chunk_sec,
+        "tse_overlap_sec": tse_overlap_sec,
         "highpass_hz": highpass_hz,
         "dual_cancel_method": dual_cancel_method,
         "dual_cancel_strength": dual_cancel_strength,
@@ -366,6 +383,7 @@ async def create_dual_job(
         "mix_file": str(mix_path),
         "manager_mic_file": str(manager_mic_path),
         "reference_file": str(reference_path) if reference_path else None,
+        "progress_file": str(job_dir / "progress.json"),
         "settings": settings,
     }
     _write_state(job_dir, state)
@@ -385,7 +403,8 @@ def list_jobs(limit: int = 50) -> List[JobSummary]:
         return []
     states = []
     for state_path in sorted(RUNS_ROOT.glob("*/job.json"), key=lambda path: path.stat().st_mtime, reverse=True):
-        states.append(JobSummary(**_read_json(state_path)))
+        state = _recover_finished_state(_read_json(state_path))
+        states.append(JobSummary(**_with_progress(state)))
         if len(states) >= limit:
             break
     return states
@@ -394,7 +413,7 @@ def list_jobs(limit: int = 50) -> List[JobSummary]:
 @app.get("/v1/jobs/{job_id}", response_model=JobSummary)
 def get_job(job_id: str) -> JobSummary:
     state = _load_state(job_id)
-    return JobSummary(**state)
+    return JobSummary(**_with_progress(state))
 
 
 @app.get("/v1/jobs/{job_id}/report")
@@ -447,6 +466,8 @@ def download_zip(job_id: str) -> FileResponse:
     if state["status"] != "succeeded":
         raise HTTPException(status_code=409, detail="job is not finished")
     zip_path = Path(state["job_dir"]) / "artifacts.zip"
+    if zip_path.exists() and not zipfile.is_zipfile(zip_path):
+        zip_path.unlink()
     if not zip_path.exists():
         _make_zip(Path(state["output_dir"]), zip_path, _artifacts_for_state(state))
     return FileResponse(zip_path, media_type="application/zip", filename=f"{job_id}_artifacts.zip")
@@ -485,8 +506,9 @@ def _run_job(job_id: str) -> None:
             ref_meta = _make_auto_reference(input_file, reference_file, float(settings["auto_reference_sec"]))
             _update_state(job_dir, {"reference_file": str(reference_file), "auto_reference": ref_meta})
 
+        progress_file = Path(state.get("progress_file", job_dir / "progress.json"))
         output_dir = job_dir / "output"
-        cmd = _build_process_command(input_file, reference_file, output_dir, settings)
+        cmd = _build_process_command(input_file, reference_file, output_dir, settings, progress_file)
         env = _runtime_env()
         completed = subprocess.run(
             cmd,
@@ -506,7 +528,6 @@ def _run_job(job_id: str) -> None:
             raise RuntimeError(f"process_call.py failed with code {completed.returncode}")
 
         report = _read_json(output_dir / "report.json")
-        _make_zip(output_dir, job_dir / "artifacts.zip", SINGLE_ARTIFACTS)
         _update_state(
             job_dir,
             {
@@ -547,8 +568,9 @@ def _run_dual_job(job_id: str) -> None:
             ref_meta = _make_auto_reference(manager_mic_file, reference_file, float(settings["auto_reference_sec"]))
             _update_state(job_dir, {"reference_file": str(reference_file), "auto_reference": ref_meta})
 
+        progress_file = Path(state.get("progress_file", job_dir / "progress.json"))
         output_dir = job_dir / "output"
-        cmd = _build_dual_process_command(mix_file, manager_mic_file, reference_file, output_dir, settings)
+        cmd = _build_dual_process_command(mix_file, manager_mic_file, reference_file, output_dir, settings, progress_file)
         env = _runtime_env()
         completed = subprocess.run(
             cmd,
@@ -568,7 +590,6 @@ def _run_dual_job(job_id: str) -> None:
             raise RuntimeError(f"process_dual_input.py failed with code {completed.returncode}")
 
         report = _read_json(output_dir / "report.json")
-        _make_zip(output_dir, job_dir / "artifacts.zip", DUAL_ARTIFACTS)
         manager_separation = report.get("manager_separation", {})
         _update_state(
             job_dir,
@@ -594,7 +615,13 @@ def _run_dual_job(job_id: str) -> None:
         )
 
 
-def _build_process_command(input_file: Path, reference_file: Path, output_dir: Path, settings: Dict[str, Any]) -> List[str]:
+def _build_process_command(
+    input_file: Path,
+    reference_file: Path,
+    output_dir: Path,
+    settings: Dict[str, Any],
+    progress_file: Path,
+) -> List[str]:
     cmd = [
         sys.executable,
         str(PROJECT_ROOT / "process_call.py"),
@@ -604,16 +631,24 @@ def _build_process_command(input_file: Path, reference_file: Path, output_dir: P
         str(reference_file),
         "--outdir",
         str(output_dir),
+        "--progress-file",
+        str(progress_file),
         "--device",
         str(settings["device"]),
         "--quality",
         str(settings["quality"]),
         "--models",
         str(settings["models"]),
+        "--processing-sample-rate",
+        str(settings["processing_sample_rate"]),
         "--chunk-sec",
         str(settings["chunk_sec"]),
         "--overlap-sec",
         str(settings["overlap_sec"]),
+        "--tse-chunk-sec",
+        str(settings["tse_chunk_sec"]),
+        "--tse-overlap-sec",
+        str(settings["tse_overlap_sec"]),
         "--speech-loudness-mode",
         str(settings["speech_loudness_mode"]),
         "--speech-target-dbfs",
@@ -664,6 +699,7 @@ def _build_dual_process_command(
     reference_file: Path,
     output_dir: Path,
     settings: Dict[str, Any],
+    progress_file: Path,
 ) -> List[str]:
     cmd = [
         sys.executable,
@@ -676,16 +712,24 @@ def _build_dual_process_command(
         str(reference_file),
         "--outdir",
         str(output_dir),
+        "--progress-file",
+        str(progress_file),
         "--device",
         str(settings["device"]),
         "--quality",
         str(settings["quality"]),
         "--models",
         str(settings["models"]),
+        "--processing-sample-rate",
+        str(settings["processing_sample_rate"]),
         "--chunk-sec",
         str(settings["chunk_sec"]),
         "--overlap-sec",
         str(settings["overlap_sec"]),
+        "--tse-chunk-sec",
+        str(settings["tse_chunk_sec"]),
+        "--tse-overlap-sec",
+        str(settings["tse_overlap_sec"]),
         "--dual-cancel-method",
         str(settings["dual_cancel_method"]),
         "--dual-cancel-strength",
@@ -824,17 +868,25 @@ def _artifacts_for_state(state: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _make_zip(output_dir: Path, zip_path: Path, artifacts: Dict[str, str]) -> None:
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for name in artifacts.values():
-            path = output_dir / name
-            if path.exists():
-                zf.write(path, arcname=name)
-        for folder in ("references", "candidates"):
-            root = output_dir / folder
-            if root.exists():
-                for path in root.rglob("*"):
-                    if path.is_file():
-                        zf.write(path, arcname=str(path.relative_to(output_dir)))
+    temp_path = zip_path.with_suffix(zip_path.suffix + ".tmp")
+    if temp_path.exists():
+        temp_path.unlink()
+    try:
+        with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            for name in artifacts.values():
+                path = output_dir / name
+                if path.exists():
+                    zf.write(path, arcname=name)
+            for folder in ("references", "candidates"):
+                root = output_dir / folder
+                if root.exists():
+                    for path in root.rglob("*"):
+                        if path.is_file():
+                            zf.write(path, arcname=str(path.relative_to(output_dir)))
+        temp_path.replace(zip_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def _load_state(job_id: str) -> Dict[str, Any]:
@@ -843,7 +895,61 @@ def _load_state(job_id: str) -> Dict[str, Any]:
     state_path = RUNS_ROOT / job_id / "job.json"
     if not state_path.exists():
         raise HTTPException(status_code=404, detail="job not found")
-    return _read_json(state_path)
+    return _recover_finished_state(_read_json(state_path))
+
+
+def _with_progress(state: Dict[str, Any]) -> Dict[str, Any]:
+    progress = None
+    progress_file = state.get("progress_file")
+    if progress_file:
+        path = Path(progress_file)
+        if path.exists():
+            try:
+                progress = _read_json(path)
+            except Exception:
+                progress = None
+    if progress is None and state.get("status") == "succeeded":
+        progress = {"stage": "done", "progress": 1.0, "message": "Processing finished", "details": {}}
+    out = dict(state)
+    out["progress"] = progress
+    return out
+
+
+def _recover_finished_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("status") not in {"queued", "running"}:
+        return state
+
+    progress_file = state.get("progress_file")
+    progress = None
+    if progress_file and Path(progress_file).exists():
+        try:
+            progress = _read_json(Path(progress_file))
+        except Exception:
+            progress = None
+    if not progress or progress.get("stage") != "done" or float(progress.get("progress", 0.0)) < 1.0:
+        return state
+
+    job_dir = Path(state["job_dir"])
+    output_dir = Path(state.get("output_dir") or job_dir / "output")
+    report_path = output_dir / "report.json"
+    if not report_path.exists():
+        return state
+
+    report = _read_json(report_path)
+    selected_tse_model = report.get("selected_tse_model")
+    if state.get("mode") == "mix_plus_manager_mic":
+        selected_tse_model = (report.get("manager_separation") or {}).get("selected_tse_model")
+    patch = {
+        "status": "succeeded",
+        "finished_at": state.get("finished_at") or _now(),
+        "runtime_sec": state.get("runtime_sec") or report.get("runtime_sec"),
+        "output_dir": str(output_dir),
+        "selected_tse_model": selected_tse_model,
+    }
+    _update_state(job_dir, patch)
+    state.update(patch)
+    state["updated_at"] = _now()
+    return state
 
 
 def _update_state(job_dir: Path, patch: Dict[str, Any]) -> None:

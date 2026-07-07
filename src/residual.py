@@ -115,6 +115,33 @@ def denoise_speech_with_residual(
             "floor": floor,
             "mask_power": mask_power,
         }
+    max_samples = int(round(sr * 120.0))
+    if len(speech) > max_samples:
+        cleaned, chunk_meta = _process_pair_in_chunks(
+            speech,
+            noise_estimate,
+            sr,
+            lambda speech_chunk, noise_chunk: denoise_speech_with_residual(
+                speech_chunk,
+                noise_chunk,
+                sr,
+                strength=strength,
+                over_subtract=over_subtract,
+                floor=floor,
+                mask_power=mask_power,
+            )[0],
+        )
+        cleaned, dc = remove_dc(cleaned)
+        return peak_limit(cleaned, ceiling=0.98), {
+            "enabled": True,
+            "method": "chunked_speech_residual_wiener_mask",
+            "strength": strength,
+            "over_subtract": over_subtract,
+            "floor": floor,
+            "mask_power": mask_power,
+            "dc_offset_removed": dc,
+            **chunk_meta,
+        }
 
     method = "speech_residual_wiener_mask"
     try:
@@ -274,6 +301,27 @@ def _spectral_duck_by_guide(
     mask_power: float,
     bounded_ratio: bool,
 ) -> Tuple[np.ndarray, Dict]:
+    max_samples = int(round(sr * 120.0))
+    if len(target) > max_samples:
+        processed, chunk_meta = _process_pair_in_chunks(
+            target,
+            guide,
+            sr,
+            lambda target_chunk, guide_chunk: _spectral_duck_by_guide(
+                target_chunk,
+                guide_chunk,
+                sr,
+                attenuation=attenuation,
+                mask_start_ratio=mask_start_ratio,
+                mask_full_ratio=mask_full_ratio,
+                mask_power=mask_power,
+                bounded_ratio=bounded_ratio,
+            )[0],
+        )
+        chunk_meta["chunked"] = True
+        chunk_meta["bounded_ratio"] = bounded_ratio
+        return processed, chunk_meta
+
     from scipy.signal import istft, stft  # type: ignore
 
     n_fft = 2048 if sr >= 16000 else 1024
@@ -305,3 +353,53 @@ def _spectral_duck_by_guide(
         "masked_bin_ratio_90": float(np.mean(mask >= 0.90)) if mask.size else 0.0,
     }
     return ensure_float32(residual), metadata
+
+
+def _process_pair_in_chunks(
+    first: np.ndarray,
+    second: np.ndarray,
+    sr: int,
+    processor,
+    *,
+    chunk_sec: float = 60.0,
+    overlap_sec: float = 2.0,
+) -> Tuple[np.ndarray, Dict]:
+    first = ensure_float32(first)
+    second = match_length(ensure_float32(second), len(first))
+    total_len = len(first)
+    chunk_len = max(1, int(round(chunk_sec * sr)))
+    overlap = max(0, int(round(overlap_sec * sr)))
+    if overlap >= chunk_len:
+        overlap = chunk_len // 4
+    hop = max(1, chunk_len - overlap)
+    starts = [start for start in range(0, max(total_len, 1), hop) if start < total_len]
+    if starts and starts[-1] + chunk_len < total_len:
+        starts.append(max(0, total_len - chunk_len))
+    if not starts:
+        starts = [0]
+    seen = set()
+    starts = [start for start in starts if not (start in seen or seen.add(start))]
+
+    output = np.zeros(total_len, dtype=np.float32)
+    weight = np.zeros(total_len, dtype=np.float32)
+    fade = max(1, overlap // 2)
+    for start in starts:
+        end = min(start + chunk_len, total_len)
+        processed = ensure_float32(processor(first[start:end], second[start:end]))
+        processed = match_length(processed, end - start)
+        window = np.ones(end - start, dtype=np.float32)
+        local_fade = min(fade, len(window) // 2)
+        if local_fade > 0:
+            ramp = np.linspace(0.0, 1.0, local_fade, endpoint=False, dtype=np.float32)
+            window[:local_fade] = np.maximum(ramp, 1e-4)
+            window[-local_fade:] = np.maximum(ramp[::-1], 1e-4)
+        output[start:end] += processed * window
+        weight[start:end] += window
+    active = weight > 1e-8
+    output[active] /= weight[active]
+    return ensure_float32(output), {
+        "chunked": True,
+        "chunk_sec": chunk_sec,
+        "overlap_sec": overlap / float(sr),
+        "num_chunks": len(starts),
+    }

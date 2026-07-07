@@ -89,8 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--models", default="wesep", help="Comma-separated TSE candidates")
     parser.add_argument("--disable-fallback", action="store_true")
     parser.add_argument("--allow-fallback", action="store_true")
+    parser.add_argument("--processing-sample-rate", type=int, default=16000)
     parser.add_argument("--chunk-sec", type=float, default=25.0)
     parser.add_argument("--overlap-sec", type=float, default=4.0)
+    parser.add_argument("--tse-chunk-sec", type=float, default=25.0)
+    parser.add_argument("--tse-overlap-sec", type=float, default=4.0)
+    parser.add_argument("--progress-file", default="")
     parser.add_argument("--highpass-hz", type=float, default=None)
 
     parser.add_argument("--dual-cancel-method", default="hybrid", choices=["simple", "adaptive_fir", "spectral_mask", "hybrid", "best"])
@@ -134,10 +138,16 @@ def build_manager_process_args(args: argparse.Namespace) -> List[str]:
         args.quality,
         "--models",
         args.models,
+        "--processing-sample-rate",
+        str(args.processing_sample_rate),
         "--chunk-sec",
         str(args.chunk_sec),
         "--overlap-sec",
         str(args.overlap_sec),
+        "--tse-chunk-sec",
+        str(args.tse_chunk_sec),
+        "--tse-overlap-sec",
+        str(args.tse_overlap_sec),
         "--speech-loudness-mode",
         args.speech_loudness_mode,
         "--speech-target-dbfs",
@@ -179,6 +189,8 @@ def build_manager_process_args(args: argparse.Namespace) -> List[str]:
         cmd.append("--allow-fallback")
     if args.require_deepfilternet:
         cmd.append("--require-deepfilternet")
+    if args.progress_file:
+        cmd.extend(["--progress-file", args.progress_file])
     if args.highpass_hz is not None:
         cmd.extend(["--highpass-hz", str(args.highpass_hz)])
     return cmd

@@ -30,6 +30,17 @@ The placeholders available to every command template are:
 - `{sample_rate}`
 - `{device}`
 
+`scripts/run_wesep_tse.py` processes long files in chunks by default:
+
+```bash
+--chunk-sec 25 --overlap-sec 4
+```
+
+The model is loaded once, each chunk is extracted with the same reference, and
+the result is stitched with overlap-add. This is required for long recordings:
+passing a 15-minute or longer file to WeSep as one tensor risks OOM, while
+chunking keeps VRAM close to the selected chunk size.
+
 ## Residual Noise Track
 
 The selected speech chain now keeps the intermediate stages:

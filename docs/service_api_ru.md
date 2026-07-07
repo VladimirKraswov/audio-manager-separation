@@ -62,6 +62,9 @@ curl http://localhost:8088/v1/defaults
 | `models` | `wesep` | использовать только выбранный WeSep-подход |
 | `disable_fallback` | `true` | не подменять WeSep простым DSP fallback |
 | `device` | `cuda:0` | GPU для инференса |
+| `processing_sample_rate` | `16000` | рабочая частота пайплайна; `0` сохраняет sample rate входа |
+| `tse_chunk_sec` | `25.0` | размер чанка для реального WeSep/TSE |
+| `tse_overlap_sec` | `4.0` | overlap между TSE-чанками для гладкой склейки |
 | `speech_loudness_mode` | `input_matched` | матчить громкость речи к активным участкам входа |
 | `speech_target_dbfs` | `-23.0` | используется только в режиме `fixed` |
 | `speech_max_gain_db` | `18.0` | максимум усиления речи |
@@ -192,6 +195,22 @@ curl -X POST http://localhost:8088/v1/jobs-dual \
 curl http://localhost:8088/v1/jobs/<job_id>
 ```
 
+Во время обработки `progress` показывает текущую стадию. Для длинных файлов в
+момент WeSep-инференса там будут поля:
+
+```json
+{
+  "stage": "wesep_extract",
+  "progress": 0.42,
+  "message": "Processed WeSep chunk 130/309",
+  "details": {
+    "chunk_current": 130,
+    "chunk_total": 309,
+    "chunk_start_sec": 2709.0
+  }
+}
+```
+
 Статусы:
 
 - `queued` - задача поставлена в очередь;
@@ -243,6 +262,10 @@ curl -L http://localhost:8088/v1/jobs/<job_id>/artifacts.zip \
   -o artifacts.zip
 ```
 
+Для длинных файлов архив может быть большим. Сервис не собирает его заранее:
+`artifacts.zip` создаётся лениво при первом запросе, а статус задачи становится
+`succeeded` сразу после готовности WAV/JSON в `output/`.
+
 ## Удалить задачу
 
 ```bash
@@ -276,6 +299,12 @@ curl -X DELETE http://localhost:8088/v1/jobs/<job_id>
 - Если есть общий микс и отдельный manager mic, используйте `/v1/jobs-dual`:
   это качественнее для `client_audio.wav`, потому что manager mic становится
   полноценным reference-track для cancellation.
+- Для длинных файлов оставляйте `tse_chunk_sec=25` и `tse_overlap_sec=4`.
+  На RTX 3060 это дало около `3.8 GB` peak VRAM на файле `1:47:57`. Если нужно
+  ещё ниже по VRAM, можно поставить `tse_chunk_sec=15`, но стыков будет больше.
+- Для звонков и длинных записей оставляйте `processing_sample_rate=16000`.
+  Это сильно уменьшает размер артефактов и память постфильтров. `0` имеет смысл
+  только если нужно сохранить исходную частоту дискретизации.
 - Если в `client_audio.wav` остаётся менеджер, поднимите
   `dual_spectral_strength` до `0.45-0.60`; если клиент становится водянистым,
   верните ближе к `0.25-0.35`.
@@ -306,7 +335,7 @@ service_runs/<job_id>/
     manager_noise_residual.wav
     manager_noise_residual_subtract.wav
     report.json
-  artifacts.zip
+  artifacts.zip              # появляется только после запроса /artifacts.zip
   job.json
 ```
 

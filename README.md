@@ -57,7 +57,10 @@ python process_call.py \
   --reference input/manager_reference_clean.wav \
   --outdir output \
   --device cuda:0 \
-  --quality max
+  --quality max \
+  --processing-sample-rate 16000 \
+  --tse-chunk-sec 25 \
+  --tse-overlap-sec 4
 ```
 
 Without configured WeSep commands, the pipeline uses the
@@ -125,7 +128,7 @@ Main endpoints:
 - `GET /v1/jobs/{job_id}/artifacts/client` - download `client_audio.wav` for dual jobs.
 - `GET /v1/jobs/{job_id}/artifacts/speech` - download `manager_speech_clean.wav`.
 - `GET /v1/jobs/{job_id}/artifacts/noise` - download `manager_noise_residual.wav`.
-- `GET /v1/jobs/{job_id}/artifacts.zip` - download all artifacts.
+- `GET /v1/jobs/{job_id}/artifacts.zip` - build and download all artifacts on demand.
 
 Russian API documentation: `docs/service_api_ru.md`.
 
@@ -150,6 +153,26 @@ The dual pipeline writes `client_audio.wav`, `manager_speech_clean.wav`, and
 `manager_noise_residual.wav`. It first uses the manager mic as a reference to
 cancel the manager side from the call mix, then removes the rough client track
 from the manager mic before running the existing target-speaker pipeline.
+
+## Long Files
+
+Real WeSep inference is chunked by default:
+
+```text
+processing_sample_rate=16000
+tse_chunk_sec=25
+tse_overlap_sec=4
+```
+
+The service decodes/resamples speech work to 16 kHz, then the wrapper loads
+WeSep once, processes each chunk with the same manager reference, and stitches
+the output with overlap-add. This keeps VRAM bounded for long recordings, while
+16 kHz processing keeps the resulting WAV artifacts smaller than full-rate
+48 kHz output. The API exposes live chunk progress through
+`GET /v1/jobs/{job_id}`. On the 1:47:57 `long_test.mp3` benchmark,
+25-second chunks on RTX 3060 used about 3.8 GB VRAM, processed the TSE stage at
+about 23x realtime, and completed the full service pipeline in about
+702 seconds.
 
 ## Benchmark
 
