@@ -1,0 +1,9 @@
+# Optional but recommended for production audio I/O and resampling.
+soundfile>=0.12
+scipy>=1.11
+librosa>=0.10
+
+# Optional model/runtime integrations.
+# For CUDA systems, prefer the official PyTorch install command for your driver.
+torch>=2.2
+speechbrain>=1.0

@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.venv/
+.venv_metis/
+venv/
+.DS_Store
+env.tse
+
+# Runtime artifacts can be large.
+output/**
+!output/.gitkeep
+input/**
+!input/.gitkeep
+runs/
+service_runs/
+benchmark/generated_mixes/**
+!benchmark/generated_mixes/.gitkeep
+
+# Model checkpoints are intentionally external.
+external/
+/models/
+/checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
